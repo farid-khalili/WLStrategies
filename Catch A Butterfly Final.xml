@@ -1,0 +1,844 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Strategy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <PreferredValues />
+  <ParameterValues />
+  <Name>RSI CAB consider</Name>
+  <Description>Enter a description for the Strategy here.</Description>
+  <Author>fkhalili</Author>
+  <CreationDate>2026-01-09T11:55:25.5525108-05:00</CreationDate>
+  <StrategyType>Code</StrategyType>
+  <StrategyData>using System;
+using System.Collections.Generic;
+using System.Linq;
+using WealthLab.Backtest;
+using WealthLab.Core;
+using WealthLab.Data;
+using WealthLab.Indicators;
+
+namespace WealthScript2
+{
+	public class CatchAButterfly_SynthButterfly_IVfromRV_NoOverlap : UserStrategyBase
+	{
+		// ===== Underlier filter params =====
+		private const int AtrLen = 15;
+		private const int AtrCompareBarsAgo = 30;
+		private const double MinAtrDropPct = 0.25; // 25% compression required over 30 bars
+
+		// ===== ATR as % of price cap =====
+		// If ATR(15) / Close &gt; 5%, block entry
+		private const double MaxAtrPctOfPrice = 0.04;
+
+		private const int VolLen = 15;
+		private const double MinAvgVol = 1_000_000;
+
+		private const double MinPrice = 10.0;
+
+		// ===== RSI on OHLC4 =====
+		private const int RsiLen = 20;
+		private const double RsiMin = 40.0;
+		private const double RsiMax = 60.0;
+
+		// ===== Butterfly/backtest params =====
+		private const double WingPct = 0.03; // kept for reference
+		private const int MinDaysAheadForExpiry = 7;
+		private const bool UseWeeklies = true;
+		private const bool AllowExpired = true;
+
+		// ===== ATR-based wings =====
+		private const double WingAtrMult = 1;        // wings = 0.8 * ATR(15)
+		private const double MinWingPctFloor = 0.01;   // at least 1% of spot
+		private const double MaxWingPctCap = 0.11;     // at most 11% of spot
+		private const double AtrFloor = 0.01;
+
+		// ===== Earnings blackout =====
+		private const int EarningsDaysBefore = 5;
+		private const int EarningsDaysAfter = 5;
+
+		// ===== ATR stop (Open-&gt;Close &gt;= 1 ATR) =====
+		private const bool UseAtrStop = true;
+
+		// ===== Dummy WL trades for navigation (1 share underlying) =====
+		private const bool UseDummyNavTrades = true;
+		private const int MaxDummyNavTradesGlobal = 30000;
+
+		// ===== VIX (CBOE) Regime Filter =====
+		private const double VixBlockLevel = 20.0;
+
+		// IMPORTANT: set this to the exact DataSet name you see in WL (Data Manager -&gt; DataSets)
+		private const string CboeDataSetName = "CBOE";   // change if needed
+		private const string VixSymbol = "VIX";          // CBOE dataset usually uses "VIX"
+
+		// ===== Print ALL trades to debug log =====
+		private const bool PrintAllTradesToDebug = true;
+
+		// ===== Series =====
+		private TimeSeries _atr15, _smaVol15;
+
+		// OHLC4 and RSI
+		private TimeSeries _ohlc4;
+		private TimeSeries _rsiOhlc4;
+
+		// HV(30) -&gt; IV estimate = SMA(30) of HV(30)
+		private TimeSeries _hv30Pct;
+		private TimeSeries _ivEst; // decimal
+
+		private TimeSeries _qualifies01;
+		private TimeSeries _pnl;     // recorded at exit bar
+		private TimeSeries _cumPnl;  // carried forward
+		private TimeSeries _winLoss; // +1/-1 at exit bar
+
+		// VIX
+		private BarHistory _vixBars;
+		private TimeSeries _vixClose;
+
+		// Per-symbol stats
+		private int _trades, _wins, _losses;
+		private double _totalPnl;
+
+		// Global stats
+		private static int _gTrades, _gWins, _gLosses;
+		private static double _gTotalPnl;
+		private static bool _globalsInitialized;
+		private static bool _printedGlobal;
+
+		// store per-trade returns globally for deciles
+		private static List&lt;double&gt; _gRetPct;   // trade return in PERCENT (e.g., +12.3)
+		private static List&lt;double&gt; _gPnL;      // raw pnl
+		private static List&lt;double&gt; _gDebit;    // entry debit
+
+		// global dummy-trade counter
+		private static int _gDummyNavTrades;
+
+		// ===== global trade blotter rows =====
+		private struct TradeRow
+		{
+			public string Symbol;
+			public DateTime EntryDate;
+			public double EntrySpot;
+			public double EntryIvUsed;   // NEW: IV used at entry (from _ivEst[idx])
+			public double EntryDebit;    // butterfly cost (debit)
+			public DateTime ExitDate;
+			public double ExitValue;
+			public double PnL;
+			public double RetPct;
+			public string ExitReason;    // "TUE" or "ATRSTOP"
+			public string CLow, CMid, CUp; // optional for audit
+		}
+		private static List&lt;TradeRow&gt; _gTradeRows;
+
+		// ===== NO-OVERLAP STATE (per symbol) =====
+		private bool _inTrade;
+		private int _entryIdx;
+		private int _exitIdx;
+
+		// Store option symbols used at entry so we price SAME contracts at exit
+		private string _cLow, _cMid, _cUp;
+		private double _entryDebit;
+
+		// Store entry spot (so blotter can print it)
+		private double _entrySpot;
+
+		// Store entry IV used (so blotter can print it)
+		private double _entryIvUsed;
+
+		// ===== Dummy trade state (per symbol) =====
+		private bool _dummyActive;
+		private string _dummyTag;
+
+		// Earnings events per symbol
+		private List&lt;int&gt; _earningsIdxs;
+
+		public override void Initialize(BarHistory bars)
+		{
+			if (!_globalsInitialized)
+			{
+				_gTrades = _gWins = _gLosses = 0;
+				_gTotalPnl = 0;
+				_printedGlobal = false;
+
+				_gRetPct = new List&lt;double&gt;(4096);
+				_gPnL = new List&lt;double&gt;(4096);
+				_gDebit = new List&lt;double&gt;(4096);
+
+				_gTradeRows = new List&lt;TradeRow&gt;(8192);
+
+				_gDummyNavTrades = 0;
+
+				_globalsInitialized = true;
+			}
+
+			_atr15 = ATR.Series(bars, AtrLen);
+			_smaVol15 = SMA.Series(bars.Volume, VolLen);
+
+			// OHLC4 + RSI
+			_ohlc4 = (bars.Open + bars.High + bars.Low + bars.Close) * 0.25;
+			_ohlc4.Description = "OHLC4";
+			_rsiOhlc4 = RSI.Series(_ohlc4, RsiLen);
+
+			_hv30Pct = HV.Series(bars.Close, 30, 252);
+			TimeSeries hv30Dec = _hv30Pct / 100.0;
+			_ivEst = SMA.Series(hv30Dec, 30);
+
+			_qualifies01 = new TimeSeries(bars.DateTimes, false) { Description = "Qualifies" };
+			_pnl = new TimeSeries(bars.DateTimes, false) { Description = "Butterfly PnL" };
+			_cumPnl = new TimeSeries(bars.DateTimes, false) { Description = "Cum PnL" };
+			_winLoss = new TimeSeries(bars.DateTimes, false) { Description = "Win/Loss" };
+
+			PlotTimeSeries(_qualifies01, "Qualifies (0/1)", "ButterflySynth", WLColor.Blue, PlotStyle.Histogram, true);
+			PlotTimeSeries(_winLoss, "Win/Loss (+1/-1)", "ButterflySynth", WLColor.Red, PlotStyle.Histogram, true);
+			PlotTimeSeries(_cumPnl, "Cum PnL", "ButterflySynth", WLColor.Green, PlotStyle.Line, true);
+
+			_trades = _wins = _losses = 0;
+			_totalPnl = 0;
+
+			_inTrade = false;
+			_entryIdx = -1;
+			_exitIdx = -1;
+			_cLow = _cMid = _cUp = null;
+			_entryDebit = double.NaN;
+			_entrySpot = double.NaN;
+			_entryIvUsed = double.NaN;
+
+			_dummyActive = false;
+			_dummyTag = null;
+
+			// ===== Load VIX =====
+			_vixBars = null;
+			_vixClose = null;
+			try
+			{
+				_vixBars = GetHistory(bars, VixSymbol, CboeDataSetName);
+				if (_vixBars != null &amp;&amp; _vixBars.Count &gt; 0)
+					_vixClose = _vixBars.Close;
+				else
+					WriteToDebugLog($"VIX filter: no data for '{VixSymbol}' from DataSet '{CboeDataSetName}'. NOT blocking entries when missing (NaN-safe).");
+			}
+			catch (Exception ex)
+			{
+				WriteToDebugLog($"VIX filter: ERROR loading '{VixSymbol}' from DataSet '{CboeDataSetName}': {ex.Message}. NOT blocking entries when missing (NaN-safe).");
+				_vixBars = null;
+				_vixClose = null;
+			}
+
+			// ===== Earnings events =====
+			_earningsIdxs = new List&lt;int&gt;();
+			try
+			{
+				List&lt;EventDataPoint&gt; earnings = bars.GetEventDataPoints("Earnings");
+				if (earnings != null &amp;&amp; earnings.Count &gt; 0)
+				{
+					HashSet&lt;int&gt; uniq = new HashSet&lt;int&gt;();
+					foreach (EventDataPoint edp in earnings)
+					{
+						int eIdx = bars.IndexOf(edp.Date, false);
+						if (eIdx &gt;= 0 &amp;&amp; eIdx &lt; bars.Count)
+							uniq.Add(eIdx);
+					}
+					_earningsIdxs.AddRange(uniq);
+					_earningsIdxs.Sort();
+				}
+			}
+			catch
+			{
+				_earningsIdxs.Clear();
+			}
+		}
+
+		public override void BacktestComplete()
+		{
+			if (_printedGlobal) return;
+			_printedGlobal = true;
+
+			double gwr = _gTrades &gt; 0 ? (double)_gWins / _gTrades : 0.0;
+
+			WriteToDebugLog(
+				"=== SYNTH BUTTERFLY FINAL SUMMARY (ALL SYMBOLS) ===\n" +
+				$"Trades:   {_gTrades}\n" +
+				$"Wins:     {_gWins}\n" +
+				$"Losses:   {_gLosses}\n" +
+				$"WinRate:  {gwr:P2}\n" +
+				$"TotalPnL: {_gTotalPnl:N4}\n" +
+				$"DummyNavTrades Placed: {_gDummyNavTrades} (cap {MaxDummyNavTradesGlobal})\n" +
+				$"Entry: Thu/Fri | Exit: Tue (or ATR stop) | Wings: {WingAtrMult:F2}*ATR (floor {MinWingPctFloor:P0}, cap {MaxWingPctCap:P0}) | " +
+				$"ATR drop&gt;= {MinAtrDropPct:P0} over {AtrCompareBarsAgo} bars | " +
+				$"ATR% cap: ATR/Close &lt;= {MaxAtrPctOfPrice:P0} | " +
+				$"IV=MA(30) of HV(30) | VIX block &gt; {VixBlockLevel:F1} (NaN-safe) | RSI(OHLC4) in [{RsiMin:F0},{RsiMax:F0}] | " +
+				$"Earnings blackout +/- {EarningsDaysBefore}/{EarningsDaysAfter} bars\n"
+			);
+
+			if (_gRetPct == null || _gRetPct.Count &lt; 10)
+			{
+				WriteToDebugLog("=== DECILES ===\nNot enough trades to compute deciles (need &gt;= 10).");
+			}
+			else
+			{
+				var rets = _gRetPct.OrderBy(x =&gt; x).ToList();
+				double avg = rets.Average();
+				double med = Median(rets);
+				int wins = _gRetPct.Count(r =&gt; r &gt; 0);
+				double wr = (double)wins / _gRetPct.Count;
+
+				WriteToDebugLog(
+					"=== RETURN % STATS (PnL / EntryDebit) ===\n" +
+					$"Trades used: {rets.Count}\n" +
+					$"Avg %:   {avg:F2}%\n" +
+					$"Median %:{med:F2}%\n" +
+					$"WinRate: {wr:P2}\n"
+				);
+
+				WriteToDebugLog("=== DECILES (by Return %) ===\nDecile | N | Avg% | Med% | WinRate");
+				for (int d = 0; d &lt; 10; d++)
+				{
+					var bucket = GetDecile(rets, d);
+					int n = bucket.Count;
+					double bAvg = bucket.Average();
+					double bMed = Median(bucket);
+					double bWr = (double)bucket.Count(x =&gt; x &gt; 0) / n;
+
+					WriteToDebugLog(
+						$"{d + 1,6} | {n,3} | {bAvg,6:F2}% | {bMed,6:F2}% | {bWr,7:P2}"
+					);
+				}
+			}
+
+			// ===== PRINT FULL TRADE BLOTTER =====
+			if (PrintAllTradesToDebug &amp;&amp; _gTradeRows != null &amp;&amp; _gTradeRows.Count &gt; 0)
+			{
+				WriteToDebugLog("=== TRADE BLOTTER (ALL TRADES) ===");
+				WriteToDebugLog("Symbol | EntryDate | Spot | IVUsed | Cost(debit) | ExitDate | ExitValue | PnL | Ret% | Exit | Calls(L/M/U)");
+
+				foreach (var r in _gTradeRows.OrderBy(x =&gt; x.EntryDate).ThenBy(x =&gt; x.Symbol))
+				{
+					string calls = $"{r.CLow} | {r.CMid} | {r.CUp}";
+					WriteToDebugLog(
+						$"{r.Symbol} | {r.EntryDate:yyyy-MM-dd} | {r.EntrySpot:F2} | {r.EntryIvUsed:P2} | {r.EntryDebit:F4} | " +
+						$"{r.ExitDate:yyyy-MM-dd} | {r.ExitValue:F4} | {r.PnL:F4} | {r.RetPct:F2}% | {r.ExitReason} | {calls}"
+					);
+				}
+			}
+		}
+
+		private static double Median(List&lt;double&gt; sorted)
+		{
+			int n = sorted.Count;
+			if (n == 0) return double.NaN;
+			if (n % 2 == 1) return sorted[n / 2];
+			return 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
+		}
+
+		private static List&lt;double&gt; GetDecile(List&lt;double&gt; sorted, int decileIndex0to9)
+		{
+			int n = sorted.Count;
+			int start = (int)Math.Floor(n * (decileIndex0to9 / 10.0));
+			int end = (int)Math.Floor(n * ((decileIndex0to9 + 1) / 10.0));
+			if (decileIndex0to9 == 9) end = n;
+			start = Math.Max(0, Math.Min(start, n));
+			end = Math.Max(start + 1, Math.Min(end, n));
+			return sorted.GetRange(start, end - start);
+		}
+
+		// ===== ATR drop% AND ATR/Price cap =====
+		private bool Qualifies(BarHistory bars, int idx)
+		{
+			int warm = Math.Max(AtrLen, Math.Max(VolLen, RsiLen));
+			int minIdx = AtrCompareBarsAgo + warm + 2;
+			if (idx &lt; minIdx) return false;
+
+			int pastIdx = idx - AtrCompareBarsAgo;
+			if (pastIdx &lt; 0 || pastIdx &gt;= _atr15.Count) return false;
+
+			double close = bars.Close[idx];
+			if (double.IsNaN(close) || close &lt;= 0) return false;
+
+			double atrNow = _atr15[idx];
+			double atrPast = _atr15[pastIdx];
+
+			bool condATR =
+				!double.IsNaN(atrNow) &amp;&amp;
+				!double.IsNaN(atrPast) &amp;&amp;
+				atrPast &gt; 0 &amp;&amp;
+				((atrPast - atrNow) / atrPast) &gt;= MinAtrDropPct;
+
+			bool condAtrPct =
+				!double.IsNaN(atrNow) &amp;&amp;
+				atrNow &gt; 0 &amp;&amp;
+				(atrNow / close) &lt;= MaxAtrPctOfPrice;
+
+			double avgVol15 = _smaVol15[idx];
+			bool condLiquid = !double.IsNaN(avgVol15) &amp;&amp; avgVol15 &gt; MinAvgVol;
+
+			bool condPrice = close &gt; MinPrice;
+
+			double rsi = _rsiOhlc4[idx];
+			if (double.IsNaN(rsi)) return false;
+			bool condRsi = rsi &gt;= RsiMin &amp;&amp; rsi &lt;= RsiMax;
+
+			return condATR &amp;&amp; condAtrPct &amp;&amp; condLiquid &amp;&amp; condPrice &amp;&amp; condRsi;
+		}
+
+		private static double RoundToIncrement(double x, double inc)
+			=&gt; Math.Round(x / inc) * inc;
+
+		private bool InEarningsBlackout(int idx)
+		{
+			if (_earningsIdxs == null || _earningsIdxs.Count == 0)
+				return false;
+
+			for (int i = 0; i &lt; _earningsIdxs.Count; i++)
+			{
+				int eIdx = _earningsIdxs[i];
+				if (idx &lt; eIdx - EarningsDaysBefore)
+					break;
+
+				if (idx &gt;= eIdx - EarningsDaysBefore &amp;&amp; idx &lt;= eIdx + EarningsDaysAfter)
+					return true;
+			}
+			return false;
+		}
+
+		private static bool IsEntryDayAllowed(DateTime dt)
+			=&gt; dt.DayOfWeek == DayOfWeek.Thursday || dt.DayOfWeek == DayOfWeek.Friday;
+
+		private static int GetNextMondayExitIdx(BarHistory bars, int entryIdx)
+		{
+			for (int i = entryIdx + 1; i &lt; bars.Count; i++)
+				if (bars.DateTimes[i].DayOfWeek == DayOfWeek.Tuesday)
+					return i;
+			return -1;
+		}
+
+		private bool HitAtrStopOpenToClose(BarHistory bars, int idx)
+		{
+			double atr = _atr15[idx];
+			if (double.IsNaN(atr) || atr &lt;= 0) return false;
+			double dayMove = Math.Abs(bars.Close[idx] - bars.Open[idx]);
+			return dayMove &gt;= atr;
+		}
+
+		private void PrintHeaderPnL(BarHistory bars, int idx)
+		{
+			if (idx != bars.Count - 1) return;
+			DrawHeaderText(
+				$"Synthetic Butterfly | Symbol PnL: {_totalPnl:N2} | Global PnL: {_gTotalPnl:N2} | Trades: {_trades} (Global: {_gTrades})",
+				(_gTotalPnl &gt;= 0 ? WLColor.DarkGreen : WLColor.Red)
+			);
+		}
+
+		private bool CanPlaceDummyNavTrade()
+		{
+			if (!UseDummyNavTrades) return false;
+			if (_gDummyNavTrades &gt;= MaxDummyNavTradesGlobal) return false;
+			return true;
+		}
+
+		private void PlaceDummyEntry(BarHistory bars, int idx, string reasonTag)
+		{
+			if (!CanPlaceDummyNavTrade()) return;
+
+			_dummyActive = true;
+			_dummyTag = $"NAV_{reasonTag}_{bars.Symbol}_{bars.DateTimes[idx]:yyyyMMdd}";
+			PlaceTrade(bars, TransactionType.Buy, OrderType.MarketClose, idx, 1, _dummyTag);
+			_gDummyNavTrades++;
+		}
+
+		private void PlaceDummyExit(BarHistory bars, int idx, string reasonTag)
+		{
+			if (!_dummyActive) return;
+			string exitTag = $"{_dummyTag}_{reasonTag}";
+			PlaceTrade(bars, TransactionType.Sell, OrderType.Market, idx, 1, exitTag);
+			_dummyActive = false;
+			_dummyTag = null;
+		}
+
+		// ===== helper to record trade row when closing =====
+		private void RecordTradeRow(BarHistory bars, int exitIdx, double exitValue, double tradePnl, string exitReason)
+		{
+			double retPct = (!double.IsNaN(_entryDebit) &amp;&amp; _entryDebit &gt; 0) ? (tradePnl / _entryDebit) * 100.0 : double.NaN;
+
+			if (_gTradeRows != null)
+			{
+				_gTradeRows.Add(new TradeRow
+				{
+					Symbol = bars.Symbol,
+					EntryDate = bars.DateTimes[_entryIdx],
+					EntrySpot = _entrySpot,
+					EntryIvUsed = _entryIvUsed, // NEW
+					EntryDebit = _entryDebit,
+					ExitDate = bars.DateTimes[exitIdx],
+					ExitValue = exitValue,
+					PnL = tradePnl,
+					RetPct = retPct,
+					ExitReason = exitReason,
+					CLow = _cLow,
+					CMid = _cMid,
+					CUp = _cUp
+				});
+			}
+		}
+
+		public override void Execute(BarHistory bars, int idx)
+		{
+			_cumPnl[idx] = idx &gt; 0 ? _cumPnl[idx - 1] : 0.0;
+
+			_qualifies01[idx] = 0;
+			_pnl[idx] = 0;
+			_winLoss[idx] = 0;
+
+			// ===== If IN trade: check ATR-stop OR scheduled Tuesday exit =====
+			if (_inTrade)
+			{
+				// BEFORE scheduled exit
+				if (idx &lt; _exitIdx)
+				{
+					bool canStopToday = UseAtrStop &amp;&amp; idx &gt; _entryIdx; // don't stop on entry day
+					bool hitStop = canStopToday &amp;&amp; HitAtrStopOpenToClose(bars, idx);
+
+					if (!hitStop)
+					{
+						PrintHeaderPnL(bars, idx);
+						return;
+					}
+
+					int stopIdx = idx;
+
+					BarHistory bhLowS = OptionSynthetic.GetHistory(bars, _cLow, _ivEst);
+					BarHistory bhMidS = OptionSynthetic.GetHistory(bars, _cMid, _ivEst);
+					BarHistory bhUpS = OptionSynthetic.GetHistory(bars, _cUp, _ivEst);
+
+					double xLowS = bhLowS.Close[stopIdx];
+					double xMidS = bhMidS.Close[stopIdx];
+					double xUpS = bhUpS.Close[stopIdx];
+
+					if (double.IsNaN(xLowS) || double.IsNaN(xMidS) || double.IsNaN(xUpS))
+					{
+						_inTrade = false;
+						_entryIdx = _exitIdx = -1;
+						_cLow = _cMid = _cUp = null;
+						_entryDebit = double.NaN;
+						_entrySpot = double.NaN;
+						_entryIvUsed = double.NaN;
+
+						PlaceDummyExit(bars, stopIdx, "ATRSTOP_NODATA");
+						PrintHeaderPnL(bars, idx);
+						return;
+					}
+
+					double exitValueS = (xLowS - 2.0 * xMidS + xUpS);
+					double tradePnlS = exitValueS - _entryDebit;
+
+					_pnl[stopIdx] = tradePnlS;
+					_cumPnl[stopIdx] = _cumPnl[stopIdx] + tradePnlS;
+					_totalPnl += tradePnlS;
+
+					_trades++; _gTrades++;
+
+					bool winS = tradePnlS &gt; 0;
+					if (winS) { _wins++; _gWins++; _winLoss[stopIdx] = 1; }
+					else { _losses++; _gLosses++; _winLoss[stopIdx] = -1; }
+
+					_gTotalPnl += tradePnlS;
+
+					if (!double.IsNaN(_entryDebit) &amp;&amp; _entryDebit &gt; 0)
+					{
+						double retPct = (tradePnlS / _entryDebit) * 100.0;
+						_gRetPct.Add(retPct);
+						_gPnL.Add(tradePnlS);
+						_gDebit.Add(_entryDebit);
+					}
+
+					// record trade row
+					RecordTradeRow(bars, stopIdx, exitValueS, tradePnlS, "ATRSTOP");
+
+					PlaceDummyExit(bars, stopIdx, "ATRSTOP");
+
+					_inTrade = false;
+					_entryIdx = _exitIdx = -1;
+					_cLow = _cMid = _cUp = null;
+					_entryDebit = double.NaN;
+					_entrySpot = double.NaN;
+					_entryIvUsed = double.NaN;
+
+					PrintHeaderPnL(bars, idx);
+					return;
+				}
+
+				// Scheduled Tuesday exit (idx &gt;= _exitIdx)
+				BarHistory bhLow = OptionSynthetic.GetHistory(bars, _cLow, _ivEst);
+				BarHistory bhMid = OptionSynthetic.GetHistory(bars, _cMid, _ivEst);
+				BarHistory bhUp = OptionSynthetic.GetHistory(bars, _cUp, _ivEst);
+
+				double xLow = bhLow.Close[_exitIdx];
+				double xMid = bhMid.Close[_exitIdx];
+				double xUp = bhUp.Close[_exitIdx];
+
+				if (double.IsNaN(xLow) || double.IsNaN(xMid) || double.IsNaN(xUp))
+				{
+					_inTrade = false;
+					_entryIdx = _exitIdx = -1;
+					_cLow = _cMid = _cUp = null;
+					_entryDebit = double.NaN;
+					_entrySpot = double.NaN;
+					_entryIvUsed = double.NaN;
+
+					PlaceDummyExit(bars, _exitIdx, "TUE_NODATA");
+					PrintHeaderPnL(bars, idx);
+					return;
+				}
+
+				double exitValue = (xLow - 2.0 * xMid + xUp);
+				double tradePnl = exitValue - _entryDebit;
+
+				_pnl[_exitIdx] = tradePnl;
+				_cumPnl[_exitIdx] = _cumPnl[_exitIdx] + tradePnl;
+				_totalPnl += tradePnl;
+
+				_trades++; _gTrades++;
+
+				bool win = tradePnl &gt; 0;
+				if (win) { _wins++; _gWins++; _winLoss[_exitIdx] = 1; }
+				else { _losses++; _gLosses++; _winLoss[_exitIdx] = -1; }
+
+				_gTotalPnl += tradePnl;
+
+				if (!double.IsNaN(_entryDebit) &amp;&amp; _entryDebit &gt; 0)
+				{
+					double retPct = (tradePnl / _entryDebit) * 100.0;
+					_gRetPct.Add(retPct);
+					_gPnL.Add(tradePnl);
+					_gDebit.Add(_entryDebit);
+				}
+
+				// record trade row
+				RecordTradeRow(bars, _exitIdx, exitValue, tradePnl, "TUE");
+
+				PlaceDummyExit(bars, _exitIdx, "TUE");
+
+				_inTrade = false;
+				_entryIdx = _exitIdx = -1;
+				_cLow = _cMid = _cUp = null;
+				_entryDebit = double.NaN;
+				_entrySpot = double.NaN;
+				_entryIvUsed = double.NaN;
+
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			// ===== Not in trade: check entry =====
+			DateTime dt = bars.DateTimes[idx];
+
+			if (!IsEntryDayAllowed(dt))
+			{
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			// ===== VIX regime block =====
+			double vix = double.NaN;
+			if (_vixClose != null &amp;&amp; idx &lt; _vixClose.Count)
+				vix = _vixClose[idx];
+
+			bool vixBlocks = (!double.IsNaN(vix)) &amp;&amp; (vix &gt; VixBlockLevel);
+			if (vixBlocks)
+			{
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			int exitIdx = GetNextMondayExitIdx(bars, idx);
+			if (exitIdx &lt; 0)
+			{
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			bool qualifies = Qualifies(bars, idx);
+			bool earningsBlock = InEarningsBlackout(idx);
+
+			_qualifies01[idx] = (qualifies &amp;&amp; !earningsBlock) ? 1 : 0;
+
+			if (!qualifies || earningsBlock)
+			{
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			double iv = _ivEst[idx];
+			if (double.IsNaN(iv) || iv &lt;= 0)
+			{
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			double s0 = bars.Close[idx];
+
+			// ===== ATR-based wings =====
+			double atrNow2 = _atr15[idx];
+			if (double.IsNaN(atrNow2) || atrNow2 &lt;= AtrFloor)
+			{
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			double wingFromAtr = WingAtrMult * atrNow2;
+			double wingFloor = s0 * MinWingPctFloor;
+			double wingCap = s0 * MaxWingPctCap;
+
+			double wingDollarsRaw = Math.Min(wingCap, Math.Max(wingFloor, wingFromAtr));
+
+			double inc = s0 &lt; 50 ? 0.5 : 1.0;
+
+			double midStrike = RoundToIncrement(s0, inc);
+			double wingDollars = RoundToIncrement(wingDollarsRaw, inc);
+
+			double lowStrike = midStrike - wingDollars;
+			double upStrike = midStrike + wingDollars;
+
+			if (!(lowStrike &lt; midStrike &amp;&amp; midStrike &lt; upStrike))
+			{
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			string cLow = OptionSynthetic.GetOptionsSymbol(
+				bars, OptionType.Call, lowStrike, dt,
+				MinDaysAheadForExpiry, UseWeeklies, AllowExpired,
+				closestStrike: true, priceIsStrike: true);
+
+			string cMid = OptionSynthetic.GetOptionsSymbol(
+				bars, OptionType.Call, midStrike, dt,
+				MinDaysAheadForExpiry, UseWeeklies, AllowExpired,
+				closestStrike: true, priceIsStrike: true);
+
+			string cUp = OptionSynthetic.GetOptionsSymbol(
+				bars, OptionType.Call, upStrike, dt,
+				MinDaysAheadForExpiry, UseWeeklies, AllowExpired,
+				closestStrike: true, priceIsStrike: true);
+
+			if (string.IsNullOrEmpty(cLow) || string.IsNullOrEmpty(cMid) || string.IsNullOrEmpty(cUp))
+			{
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			BarHistory bhLowE = OptionSynthetic.GetHistory(bars, cLow, _ivEst);
+			BarHistory bhMidE = OptionSynthetic.GetHistory(bars, cMid, _ivEst);
+			BarHistory bhUpE = OptionSynthetic.GetHistory(bars, cUp, _ivEst);
+
+			double eLow = bhLowE.Close[idx];
+			double eMid = bhMidE.Close[idx];
+			double eUp = bhUpE.Close[idx];
+
+			if (double.IsNaN(eLow) || double.IsNaN(eMid) || double.IsNaN(eUp))
+			{
+				PrintHeaderPnL(bars, idx);
+				return;
+			}
+
+			double entryDebit = (eLow - 2.0 * eMid + eUp);
+
+			_inTrade = true;
+			_entryIdx = idx;
+			_exitIdx = exitIdx;
+			_cLow = cLow; _cMid = cMid; _cUp = cUp;
+			_entryDebit = entryDebit;
+			_entrySpot = s0;
+			_entryIvUsed = iv; // NEW: store IV used at entry
+
+			PlaceDummyEntry(bars, idx, "BF");
+
+			PrintHeaderPnL(bars, idx);
+		}
+	}
+}
+</StrategyData>
+  <LibraryName />
+  <FolderName>CAB final stretch</FolderName>
+  <DataSetName>Catch a butterfly no biotech</DataSetName>
+  <UseSelectedDataSetOnly>false</UseSelectedDataSetOnly>
+  <SingleSymbolMode>false</SingleSymbolMode>
+  <Scale>
+    <Frequency>Daily</Frequency>
+    <Interval>1</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </Scale>
+  <DataRange>
+    <DataRangeType>RecentYears</DataRangeType>
+    <RecentValue>2</RecentValue>
+    <StartDate>0001-01-01T00:00:00</StartDate>
+    <EndDate>0001-01-01T00:00:00</EndDate>
+  </DataRange>
+  <PositionSize>
+    <PositionSizeType>Dollar</PositionSizeType>
+    <Amount>2000</Amount>
+    <PositionSizerName />
+    <PositionSizerParameters />
+    <StartingCapital>10000000</StartingCapital>
+    <MarginFactor>1</MarginFactor>
+    <MaxOpenPositions>0</MaxOpenPositions>
+    <MaxOpenPositionsLong>0</MaxOpenPositionsLong>
+    <MaxOpenPositionsShort>0</MaxOpenPositionsShort>
+    <MaxOpenPositionsInSymbol>0</MaxOpenPositionsInSymbol>
+    <UseNextBarOpenAsBasisPrice>false</UseNextBarOpenAsBasisPrice>
+    <StartingCapOptValues>
+      <MinValue>50000</MinValue>
+      <MaxValue>200000</MaxValue>
+      <StepValue>10000</StepValue>
+    </StartingCapOptValues>
+    <FixedAmountOptValues>
+      <MinValue>1000</MinValue>
+      <MaxValue>10000</MaxValue>
+      <StepValue>1000</StepValue>
+    </FixedAmountOptValues>
+    <PctEquityOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>20</MaxValue>
+      <StepValue>1</StepValue>
+    </PctEquityOptValues>
+    <FixedQtyOptValues>
+      <MinValue>100</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>100</StepValue>
+    </FixedQtyOptValues>
+    <MarginOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>2</MaxValue>
+      <StepValue>0.1</StepValue>
+    </MarginOptValues>
+    <MaxRiskOptValues>
+      <MinValue>5</MinValue>
+      <MaxValue>50</MaxValue>
+      <StepValue>5</StepValue>
+    </MaxRiskOptValues>
+    <MaxOpenPosOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>1</StepValue>
+    </MaxOpenPosOptValues>
+    <MaxSignalsPerBar>0</MaxSignalsPerBar>
+    <StartingCapOpt>false</StartingCapOpt>
+    <AmountOpt>false</AmountOpt>
+    <MarginOpt>false</MarginOpt>
+    <MaxOpenPosOpt>false</MaxOpenPosOpt>
+  </PositionSize>
+  <Benchmark>SPY</Benchmark>
+  <SingleSymbol>SPY</SingleSymbol>
+  <RunWithWFOParameters>false</RunWithWFOParameters>
+  <RunWithPreferredValues>false</RunWithPreferredValues>
+  <RetainNSF>true</RetainNSF>
+  <GranularLimitStopScale>
+    <Frequency>Minute</Frequency>
+    <Interval>10</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </GranularLimitStopScale>
+  <UpdateGranularData>true</UpdateGranularData>
+  <IsWLComPublishedStrategy>false</IsWLComPublishedStrategy>
+  <IsWLComUserStrategy>false</IsWLComUserStrategy>
+  <MarkedReadOnly>false</MarkedReadOnly>
+  <IsRunningInEvolver>false</IsRunningInEvolver>
+  <CouldOptimize>false</CouldOptimize>
+  <ParametersEnabled />
+  <IsLinkedToExternalFile>false</IsLinkedToExternalFile>
+  <LinkedFileName />
+  <CompiledStrategyTypeName />
+</Strategy>

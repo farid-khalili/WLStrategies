@@ -1,0 +1,278 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Strategy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <PreferredValues />
+  <ParameterValues />
+  <Name>avwap</Name>
+  <Description>Enter a description for the Strategy here.</Description>
+  <Author>fkhalili</Author>
+  <CreationDate>2026-02-10T12:54:04.4339906-05:00</CreationDate>
+  <StrategyType>Code</StrategyType>
+  <StrategyData>using System;
+using WealthLab.Backtest;
+using WealthLab.Core;
+using WealthLab.Indicators;
+
+namespace WealthScript1 
+{
+	public class AVWAP_After_3to4Day_Drop_NoATR : UserStrategyBase
+	{
+		// ===== PARAMETERS =====
+		private const int MinDropDays = 3;
+		private const int MaxDropDays = 4;
+
+		private const int MaxHoldDays = 7;        // 7 daily bars
+		private const int CooldownBars = 10;
+
+		// ===== DOLLAR VOLUME FILTER =====
+		private const int DvLen = 20;
+		private const double MinAvgDollarVol = 5_000_000.0;   // $5M/day
+
+		// ===== STATE =====
+		private int _anchorBar = -1;
+		private int _entryBarForEpisode = -1;
+
+		private double _cumPV = 0;
+		private double _cumVol = 0;
+
+		private TimeSeries _avwap;
+
+		// Dollar volume series + average
+		private TimeSeries _dollarVol;
+		private TimeSeries _avgDollarVol20;
+
+		public override void Initialize(BarHistory bars)
+		{
+			_avwap = new TimeSeries(bars.DateTimes, true);
+			_avwap.Description = "AVWAP";
+
+			// Build DollarVol series: Close * Volume
+			_dollarVol = new TimeSeries(bars.DateTimes, true);
+			for (int i = 0; i &lt; bars.Count; i++)
+				_dollarVol[i] = bars.Close[i] * bars.Volume[i];
+
+			// 20-day average DollarVol
+			_avgDollarVol20 = SMA.Series(_dollarVol, DvLen);
+
+			// warmup needs drop-days + dollar-vol length
+			StartIndex = Math.Max(MaxDropDays + 1, DvLen + 1);
+		}
+
+		public override void Execute(BarHistory bars, int idx)
+		{
+			if (idx &lt; StartIndex)
+				return;
+
+			// =====================================================
+			// 1) Build AVWAP if episode active
+			// =====================================================
+			if (_anchorBar &gt;= 0 &amp;&amp; idx &gt;= _anchorBar)
+			{
+				double typical = (bars.High[idx] + bars.Low[idx] + bars.Close[idx]) / 3.0;
+				double v = bars.Volume[idx];
+
+				_cumPV += typical * v;
+				_cumVol += v;
+
+				_avwap[idx] = (_cumVol &gt; 0.0) ? (_cumPV / _cumVol) : double.NaN;
+			}
+			else
+			{
+				_avwap[idx] = double.NaN;
+			}
+
+			// =====================================================
+			// 2) EXIT RULES
+			// =====================================================
+			for (int i = OpenPositions.Count - 1; i &gt;= 0; i--)
+			{
+				Position pos = OpenPositions[i];
+				if (pos.PositionType != PositionType.Long)
+					continue;
+
+				int barsHeld = idx - pos.EntryBar;
+
+				if (!double.IsNaN(_avwap[idx]) &amp;&amp; bars.Close[idx] &gt;= _avwap[idx])
+				{
+					ClosePosition(pos, OrderType.Market);
+				}
+				else if (barsHeld &gt;= MaxHoldDays)
+				{
+					ClosePosition(pos, OrderType.Market);
+				}
+			}
+
+			// =====================================================
+			// 3) Cooldown / episode control
+			// =====================================================
+			if (_entryBarForEpisode &gt;= 0)
+			{
+				if (!HasOpenPosition(bars, PositionType.Long) &amp;&amp;
+					idx - _entryBarForEpisode &gt;= CooldownBars)
+				{
+					ResetEpisode();
+				}
+				return;
+			}
+
+			if (HasOpenPosition(bars, PositionType.Long))
+				return;
+
+			// =====================================================
+			// 4) Detect 3–4 consecutive down closes
+			//     + REQUIRE AvgDollarVol20 &gt;= $5,000,000 AT EXPECTED ENTRY BAR (idx+1)
+			// =====================================================
+			for (int d = MinDropDays; d &lt;= MaxDropDays; d++)
+			{
+				int a = idx - d;
+
+				bool allDown = true;
+				for (int k = a + 1; k &lt;= idx; k++)
+				{
+					if (bars.Close[k] &gt;= bars.Close[k - 1])
+					{
+						allDown = false;
+						break;
+					}
+				}
+
+				if (!allDown)
+					continue;
+
+				// Market order enters next bar: enforce liquidity on entry bar
+				int entryIdx = idx + 1;
+				if (entryIdx &gt;= bars.Count)
+					continue;
+
+				double adv = _avgDollarVol20[entryIdx];
+				if (double.IsNaN(adv) || adv &lt; MinAvgDollarVol)
+					continue;
+
+				// ---- Trigger episode ----
+				_anchorBar = a;
+				_cumPV = 0;
+				_cumVol = 0;
+
+				// Build AVWAP from anchor to current bar immediately
+				for (int t = _anchorBar; t &lt;= idx; t++)
+				{
+					double typical = (bars.High[t] + bars.Low[t] + bars.Close[t]) / 3.0;
+					double v = bars.Volume[t];
+
+					_cumPV += typical * v;
+					_cumVol += v;
+
+					_avwap[t] = (_cumVol &gt; 0.0) ? (_cumPV / _cumVol) : double.NaN;
+				}
+
+				// =========================================================
+				// WL8-CORRECT: store anchor bar index in Position.Tag via positionTag
+				// =========================================================
+				int positionTag = _anchorBar; // -1 means "not set" (default)
+				var tx = PlaceTrade(bars, TransactionType.Buy, OrderType.Market, 0, positionTag);
+				if (tx != null)
+					tx.SignalName = "ENTRY";
+
+				_entryBarForEpisode = idx;
+				break;
+			}
+		}
+
+		private void ResetEpisode()
+		{
+			_anchorBar = -1;
+			_entryBarForEpisode = -1;
+			_cumPV = 0;
+			_cumVol = 0;
+		}
+	}
+}</StrategyData>
+  <LibraryName />
+  <FolderName>meta data</FolderName>
+  <DataSetName>Russell 3000 Current &amp; Past;Norgate Data</DataSetName>
+  <UseSelectedDataSetOnly>false</UseSelectedDataSetOnly>
+  <SingleSymbolMode>false</SingleSymbolMode>
+  <Scale>
+    <Frequency>Daily</Frequency>
+    <Interval>1</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </Scale>
+  <DataRange>
+    <DataRangeType>RecentYears</DataRangeType>
+    <RecentValue>27</RecentValue>
+    <StartDate>0001-01-01T00:00:00</StartDate>
+    <EndDate>0001-01-01T00:00:00</EndDate>
+  </DataRange>
+  <PositionSize>
+    <PositionSizeType>Dollar</PositionSizeType>
+    <Amount>500</Amount>
+    <PositionSizerName />
+    <PositionSizerParameters />
+    <StartingCapital>100000</StartingCapital>
+    <MarginFactor>1</MarginFactor>
+    <MaxOpenPositions>0</MaxOpenPositions>
+    <MaxOpenPositionsLong>0</MaxOpenPositionsLong>
+    <MaxOpenPositionsShort>0</MaxOpenPositionsShort>
+    <MaxOpenPositionsInSymbol>0</MaxOpenPositionsInSymbol>
+    <UseNextBarOpenAsBasisPrice>false</UseNextBarOpenAsBasisPrice>
+    <StartingCapOptValues>
+      <MinValue>50000</MinValue>
+      <MaxValue>200000</MaxValue>
+      <StepValue>10000</StepValue>
+    </StartingCapOptValues>
+    <FixedAmountOptValues>
+      <MinValue>1000</MinValue>
+      <MaxValue>10000</MaxValue>
+      <StepValue>1000</StepValue>
+    </FixedAmountOptValues>
+    <PctEquityOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>20</MaxValue>
+      <StepValue>1</StepValue>
+    </PctEquityOptValues>
+    <FixedQtyOptValues>
+      <MinValue>100</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>100</StepValue>
+    </FixedQtyOptValues>
+    <MarginOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>2</MaxValue>
+      <StepValue>0.1</StepValue>
+    </MarginOptValues>
+    <MaxRiskOptValues>
+      <MinValue>5</MinValue>
+      <MaxValue>50</MaxValue>
+      <StepValue>5</StepValue>
+    </MaxRiskOptValues>
+    <MaxOpenPosOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>1</StepValue>
+    </MaxOpenPosOptValues>
+    <MaxSignalsPerBar>0</MaxSignalsPerBar>
+    <StartingCapOpt>false</StartingCapOpt>
+    <AmountOpt>false</AmountOpt>
+    <MarginOpt>false</MarginOpt>
+    <MaxOpenPosOpt>false</MaxOpenPosOpt>
+  </PositionSize>
+  <Benchmark>SPY</Benchmark>
+  <SingleSymbol>SPY</SingleSymbol>
+  <RunWithWFOParameters>false</RunWithWFOParameters>
+  <RunWithPreferredValues>false</RunWithPreferredValues>
+  <RetainNSF>true</RetainNSF>
+  <GranularLimitStopScale>
+    <Frequency>Daily</Frequency>
+    <Interval>1</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </GranularLimitStopScale>
+  <UpdateGranularData>true</UpdateGranularData>
+  <IsWLComPublishedStrategy>false</IsWLComPublishedStrategy>
+  <IsWLComUserStrategy>false</IsWLComUserStrategy>
+  <MarkedReadOnly>false</MarkedReadOnly>
+  <IsRunningInEvolver>false</IsRunningInEvolver>
+  <CouldOptimize>false</CouldOptimize>
+  <ParametersEnabled />
+  <IsLinkedToExternalFile>false</IsLinkedToExternalFile>
+  <LinkedFileName />
+  <CompiledStrategyTypeName />
+</Strategy>

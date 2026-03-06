@@ -1,0 +1,985 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Strategy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <PreferredValues />
+  <ParameterValues />
+  <Name>Morning Payout 2/10</Name>
+  <Description>Enter a description for the Strategy here.</Description>
+  <Author>fkhalili</Author>
+  <CreationDate>2026-02-10T12:33:25.8276312-05:00</CreationDate>
+  <StrategyType>Code</StrategyType>
+  <StrategyData>using System;
+using System.Collections.Generic;
+using WealthLab.Backtest;
+using WealthLab.Core;
+using WealthLab.Data;
+using WealthLab.Indicators;
+
+namespace WealthScript2
+{
+	/// &lt;summary&gt;
+	/// SPY Hourly Calendar/Diagonal (OptionSynthetic legs) – WL engine PnL per-leg (like CoveredCalls)
+	/// - Entry: EntryHour on 60-min bars
+	/// - Exit: HARD time exit by ExitHour next trading day (DATE-AWARE, not index-based)
+	/// - Early exit: +13% target / -25% stop (COMBINED spread mark-to-market from CLOSE mids; no friction)
+	///
+	/// Trend diagonal rule (daily):
+	/// - TrendUp = ADX(14)&gt;18 AND +DI&gt;-DI AND Close&gt;SMA(50) on DAILY bars
+	/// - aligned to intraday using PREVIOUS trading day (no lookahead)
+	/// - If TrendUp: short/front strike = ATM+1, long/back = ATM; else same strike calendar
+	///
+	/// VIX:
+	/// - Daily close aligned to intraday using PREVIOUS trading day (no lookahead)
+	/// - IV base = VIX/100 clamped, scaled by IvScaleVsVix for BOTH legs
+	///
+	/// Regime entry filter:
+	/// - block entry if intraday Close &lt; PREV-DAY DAILY SMA(100) (aligned prev-day)
+	///
+	/// POSITION SIZING:
+	/// - fixed capital per trade: contracts = floor(5000 / ABS(entrySpreadMid))
+	///
+	/// Session handling (holidays + half days):
+	/// - Holidays: no bars =&gt; no entry naturally.
+	/// - Half-days / early closes: BLOCK entry if the session is missing the "late session" bars typical of a normal day.
+	///   (We check for presence of 15:00 or 16:00 bars on that date; if neither exists, we skip entry.)
+	/// &lt;/summary&gt;
+	public class SPY_Hourly_Calendar_Legs_Open3PM_Close1PM_NextDay_DailyVIX_DiagonalDailyTrend_Risk : UserStrategyBase
+	{
+		private const double StrikeIncrement = 1.0;
+
+		private const string CboeDataSetName = "CBOE";
+		private const string VixSymbol = "VIX";
+
+		private static readonly bool UseVixBlock = true;
+		private const double VixBlockLevel = 20.0;
+
+		private static readonly bool CarryForwardMissingVix = true;
+
+		private const double MinIvDec = 0.01;
+		private const double MaxIvDec = 2.00;
+
+		// Entry time (hourly bars typically stamped at :00)
+		private const int EntryHour = 14; // 2-3 PM (kept as in your current code)
+		private const int ExitHour = 11;  // next trading day or later @&gt;= 11:00 (date-aware)
+
+		// EARLY EXIT (combined spread, not per-leg)
+		private const double ProfitTargetPct = 13.0;
+		private const double StopLossPct = 25.0;
+
+		private static readonly bool EnableDebug = true;
+		private static readonly bool DebugOnlyLastBar = false;
+
+		private const double IvScaleVsVix = 0.85;
+
+		private const int AdxLen = 14;
+		private const double AdxMin = 18.0;
+		private const int TrendSmaLen = 50;
+
+		private const int DailySma100Len = 100;
+		private TimeSeries _dailySma100Intraday;
+
+		private const double CapitalPerTrade = 5000.0;
+		private const int MaxContracts = 5000;
+
+		private TimeSeries _vix;
+		private TimeSeries _ivBase;
+		private TimeSeries _ivFront;
+		private TimeSeries _ivBack;
+
+		private TimeSeries _trendUpIntraday;
+
+		private Dictionary&lt;string, BarHistory&gt; _optCacheFront;
+		private Dictionary&lt;string, BarHistory&gt; _optCacheBack;
+
+		private BarHistory _underlierFull;
+
+		// trade state
+		private bool _inSpread;
+		private int _entryIdx;
+		private int _exitIdx; // kept for logging/compat; NOT used for hard-exit anymore
+
+		private string _longSym;
+		private string _shortSym;
+
+		private BarHistory _longBars;
+		private BarHistory _shortBars;
+
+		private int _contracts;
+
+		// entry spread value (mid, no friction) - used for sizing and for combined-spread target/stop
+		private double _entrySpreadMid;
+
+		// WL positions (legs)
+		private int _longHash = -1;
+		private int _shortHash = -1;
+		private Position _posLong;
+		private Position _posShort;
+
+		public override void Initialize(BarHistory bars)
+		{
+			_underlierFull = bars;
+
+			_optCacheFront = new Dictionary&lt;string, BarHistory&gt;(2048);
+			_optCacheBack = new Dictionary&lt;string, BarHistory&gt;(2048);
+
+			_vix = LoadAndAlignDailyVixCloseToIntraday_PrevTradingDay(bars);
+			_ivBase = BuildIVFromVix(_vix, CarryForwardMissingVix);
+			_ivFront = ScaleIvSeries(_ivBase, IvScaleVsVix);
+			_ivBack = ScaleIvSeries(_ivBase, IvScaleVsVix);
+
+			BuildDailyTrendUpAndAlignToIntraday(bars);
+			BuildDailySma100AndAlignToIntraday(bars);
+
+			StartIndex = Math.Max(60, DailySma100Len);
+
+			ResetState();
+
+			DLog($"INIT | Entry@{EntryHour}:00 | HARD Exit next day @&gt;= {ExitHour}:00 | Target={ProfitTargetPct:F1}% | Stop={StopLossPct:F1}% (COMBINED spread, mark-to-market)");
+			DLog($"INIT | Session handling: holidays naturally skipped; early-close days skipped if missing 15:00 AND 16:00 bars");
+			DLog($"INIT | StrikeInc={StrikeIncrement} | UseVixBlock={UseVixBlock} (&gt;{VixBlockLevel}) | CarryForwardMissingVix={CarryForwardMissingVix}");
+			DLog($"INIT | IV: base=VIX/100 (prev-day aligned), scaled by {IvScaleVsVix:F2} for both legs (OptionSynthetic pricing)");
+			DLog($"INIT | TrendUp daily: ADX({AdxLen})&gt;{AdxMin:F1} AND +DI&gt;-DI AND Close&gt;SMA({TrendSmaLen}) aligned prev-day");
+			DLog($"INIT | Regime: block if intraday Close &lt; prev-day DAILY SMA({DailySma100Len})");
+			DLog($"INIT | Sizing: cap=${CapitalPerTrade:F0} =&gt; contracts=floor(cap/ABS(entrySpreadMid)), MaxContracts={MaxContracts}");
+			DLog($"INIT | Entry day rule: FRIDAYS BLOCKED");
+			DLog($"INIT | Back leg expiry: 7 CALENDAR days (snapped forward to next trading date if needed)");
+			DLog($"INIT | HARD EXIT: date-aware (must be on a later trading day AND at/after {ExitHour}:00)");
+		}
+
+		public override void Execute(BarHistory bars, int idx)
+		{
+			DateTime now = bars.DateTimes[idx];
+
+			// ===== In trade: early exits + time stop + last bar =====
+			if (_inSpread)
+			{
+				if (_posLong == null) _posLong = FindOpenPositionAllSymbols(_longHash);
+				if (_posShort == null) _posShort = FindOpenPositionAllSymbols(_shortHash);
+
+				// ===== HARD EXIT (DATE-AWARE) =====
+				DateTime entryDate = (_entryIdx &gt;= 0) ? bars.DateTimes[_entryIdx].Date : DateTime.MinValue;
+				DateTime currentDate = now.Date;
+
+				bool isNextDayOrLater = (entryDate != DateTime.MinValue) &amp;&amp; (currentDate &gt; entryDate);
+				bool isAtOrAfterExitTime = (now.Hour &gt; ExitHour) || (now.Hour == ExitHour &amp;&amp; now.Minute &gt;= 0);
+				bool timeExit = isNextDayOrLater &amp;&amp; isAtOrAfterExitTime;
+
+				// ===== Mark-to-market combined spread (NO friction) =====
+				double longC = (_longBars != null &amp;&amp; idx &lt; _longBars.Count) ? _longBars.Close[idx] : double.NaN;
+				double shortC = (_shortBars != null &amp;&amp; idx &lt; _shortBars.Count) ? _shortBars.Close[idx] : double.NaN;
+
+				bool okMark = !(double.IsNaN(longC) || double.IsNaN(shortC) || longC &lt;= 0 || shortC &lt;= 0);
+				double spreadNow = okMark ? (longC - shortC) : double.NaN;
+
+				double markRetPct = double.NaN;
+				if (okMark &amp;&amp; !double.IsNaN(_entrySpreadMid) &amp;&amp; _entrySpreadMid != 0.0)
+					markRetPct = ((spreadNow - _entrySpreadMid) / Math.Abs(_entrySpreadMid)) * 100.0;
+
+				bool earlyExit = false;
+				string earlyReason = null;
+
+				// Only consider early exits after the entry bar
+				if (!timeExit &amp;&amp; idx &gt; _entryIdx &amp;&amp; okMark &amp;&amp; !double.IsNaN(markRetPct))
+				{
+					if (markRetPct &gt;= ProfitTargetPct)
+					{
+						earlyExit = true;
+						earlyReason = $"TARGET {ProfitTargetPct:F1}% hit (markRet={markRetPct:F2}%)";
+					}
+					else if (markRetPct &lt;= -StopLossPct)
+					{
+						earlyExit = true;
+						earlyReason = $"STOP -{StopLossPct:F1}% hit (markRet={markRetPct:F2}%)";
+					}
+				}
+
+				bool lastBarExit = (idx &gt;= bars.Count - 1);
+
+				if (!timeExit &amp;&amp; !earlyExit &amp;&amp; !lastBarExit)
+					return;
+
+				string why =
+					earlyExit ? earlyReason :
+					timeExit ? $"TIME EXIT (next day or later @&gt;= {ExitHour}:00)" :
+					"LAST BAR (forced)";
+
+				DLog($"EXIT-SIGNAL | {now:yyyy-MM-dd HH:mm} | {why} | entryDate={entryDate:yyyy-MM-dd} currDate={currentDate:yyyy-MM-dd}");
+
+				CloseLegs();
+				ResetState();
+				return;
+			}
+
+			// ===== Entry only at EntryHour =====
+			if (!IsExactHourBar(now, EntryHour))
+				return;
+
+			// ===== Block Friday entries =====
+			if (now.DayOfWeek == DayOfWeek.Friday)
+			{
+				DLogMaybe(idx, bars, $"BLOCK | {now:yyyy-MM-dd HH:mm} | Friday entry blocked");
+				return;
+			}
+
+			// ===== Block half-days / early closes (robust; does not require knowing holiday dates) =====
+			if (!DayHasHourBar(bars, idx, 15) &amp;&amp; !DayHasHourBar(bars, idx, 16))
+			{
+				DLogMaybe(idx, bars,
+					$"BLOCK | {now:yyyy-MM-dd HH:mm} | Short/early-close session detected (missing 15:00/16:00 bars); skip entry");
+				return;
+			}
+
+			// Regime filter: prev-day daily SMA(100)
+			double dailySma100 = (_dailySma100Intraday != null &amp;&amp; idx &gt;= 0 &amp;&amp; idx &lt; _dailySma100Intraday.Count) ? _dailySma100Intraday[idx] : double.NaN;
+			double spotNow = bars.Close[idx];
+
+			if (double.IsNaN(dailySma100))
+			{
+				DLogMaybe(idx, bars, $"NOQUAL | {now:yyyy-MM-dd HH:mm} | DAILY SMA({DailySma100Len}) not available yet");
+				return;
+			}
+			if (spotNow &lt; dailySma100)
+			{
+				DLogMaybe(idx, bars, $"BLOCK | {now:yyyy-MM-dd HH:mm} | Close={spotNow:F2} &lt; PREV-DAY DAILY SMA({DailySma100Len})={dailySma100:F2}");
+				return;
+			}
+
+			// Keep the old index-based exitIdx for logging only (not used for hard exit anymore)
+			int exitIdx = GetNextTradingDayHourIndex(bars, idx, ExitHour);
+			if (exitIdx &lt; 0)
+			{
+				DLogMaybe(idx, bars, $"NOQUAL | {now:yyyy-MM-dd HH:mm} | no next-day {ExitHour}:00 bar available for exit");
+				return;
+			}
+
+			double vixNow = GetAlignedVix(idx);
+			double ivBaseNow = GetIvBaseDec(idx);
+			double ivFrontNow = GetIvFrontDec(idx);
+			double ivBackNow = GetIvBackDec(idx);
+
+			if (UseVixBlock &amp;&amp; !double.IsNaN(vixNow) &amp;&amp; vixNow &gt; VixBlockLevel)
+			{
+				DLogMaybe(idx, bars, $"BLOCK | {now:yyyy-MM-dd HH:mm} | VIX(prev-day)={vixNow:F2} &gt; {VixBlockLevel:F2}");
+				return;
+			}
+			if (double.IsNaN(ivFrontNow) || ivFrontNow &lt;= 0)
+			{
+				DLogMaybe(idx, bars, $"NOQUAL | {now:yyyy-MM-dd HH:mm} | IV invalid (frontIV={ivFrontNow}) | VIX(prev-day)={(double.IsNaN(vixNow) ? "NaN" : vixNow.ToString("F2"))}");
+				return;
+			}
+
+			bool trendUp = GetTrendUpIntraday(idx);
+
+			double spot = bars.Close[idx];
+			double atmStrike = RoundToIncrement(spot, StrikeIncrement);
+
+			double longStrike = atmStrike;
+			double shortStrike = trendUp ? (atmStrike + StrikeIncrement) : atmStrike;
+
+			DateTime exp1 = GetNextTradingDayDate(bars, idx);
+			if (exp1 == DateTime.MinValue)
+			{
+				DLogMaybe(idx, bars, $"NOQUAL | {now:yyyy-MM-dd HH:mm} | could not find next trading day for exp1DTE");
+				return;
+			}
+
+			DLog($"DEBUG | exp1 check | nowDate={now:yyyy-MM-dd} exp1={exp1:yyyy-MM-dd} sameDay={(exp1.Date == now.Date)}");
+
+			DateTime exp7 = GetCalendarDaysThenSnapToNextTradingDay(bars, idx, 7);
+			if (exp7 == DateTime.MinValue)
+			{
+				DLogMaybe(idx, bars, $"NOQUAL | {now:yyyy-MM-dd HH:mm} | could not compute exp7 (7 calendar days) from bars");
+				return;
+			}
+
+			string longSym = OptionSynthetic.Symbol(bars, OptionType.Call, longStrike, exp7);
+			string shortSym = OptionSynthetic.Symbol(bars, OptionType.Call, shortStrike, exp1);
+
+			BarHistory longBars = GetOrCreateOptionHistory(bars, longSym, isBackLeg: true);
+			BarHistory shortBars = GetOrCreateOptionHistory(bars, shortSym, isBackLeg: false);
+
+			if (longBars == null || shortBars == null)
+			{
+				DLogMaybe(idx, bars, $"NOQUAL | {now:yyyy-MM-dd HH:mm} | option history missing | longOk={(longBars != null)} shortOk={(shortBars != null)}");
+				return;
+			}
+
+			double longMid = longBars.Close[idx];
+			double shortMid = shortBars.Close[idx];
+
+			if (double.IsNaN(longMid) || double.IsNaN(shortMid) || longMid &lt;= 0 || shortMid &lt;= 0)
+			{
+				DLogMaybe(idx, bars, $"NOQUAL | {now:yyyy-MM-dd HH:mm} | option px invalid | longMid={longMid} shortMid={shortMid}");
+				return;
+			}
+
+			double entrySpreadMid = longMid - shortMid;
+			double entryDebitAbs = Math.Abs(entrySpreadMid);
+			if (double.IsNaN(entryDebitAbs) || entryDebitAbs &lt;= 0.0)
+			{
+				DLogMaybe(idx, bars, $"NOQUAL | {now:yyyy-MM-dd HH:mm} | entry spread invalid for sizing | spreadMid={entrySpreadMid}");
+				return;
+			}
+
+			int contracts = (int)Math.Floor(CapitalPerTrade / entryDebitAbs);
+			if (contracts &lt; 1) contracts = 1;
+			if (contracts &gt; MaxContracts) contracts = MaxContracts;
+
+			DLog(
+				$"ENTRY | {now:yyyy-MM-dd HH:mm} | spot={spot:F2} atm={atmStrike:F2} trendUpDaily={trendUp} " +
+				$"| strikes: long(back)={longStrike:F2} short(front)={shortStrike:F2} " +
+				$"| VIX(prev-day)={vixNow:F2} =&gt; IVbase={ivBaseNow:F4} IVfront={ivFrontNow:F4} IVback={ivBackNow:F4} " +
+				$"| exp1={exp1:yyyy-MM-dd} exp7={exp7:yyyy-MM-dd} " +
+				$"| mid: long={longMid:F4} short={shortMid:F4} spreadMid={entrySpreadMid:F4} " +
+				$"| contracts={contracts} cap=${CapitalPerTrade:F0} | hardExitIdx(nextDay {ExitHour}:00)={exitIdx} | Target={ProfitTargetPct:F1}% Stop={StopLossPct:F1}%"
+			);
+
+			_inSpread = true;
+			_entryIdx = idx;
+			_exitIdx = exitIdx;
+
+			_longSym = longSym;
+			_shortSym = shortSym;
+
+			_longBars = longBars;
+			_shortBars = shortBars;
+
+			_contracts = contracts;
+			_entrySpreadMid = entrySpreadMid;
+
+			_longHash = Math.Abs(_longSym.GetHashCode());
+			_shortHash = Math.Abs(_shortSym.GetHashCode());
+
+			OpenLegs(idx);
+		}
+
+		// =========================================================
+		// Robust early-close detector (no holiday list needed)
+		// =========================================================
+		private static bool DayHasHourBar(BarHistory bars, int idx, int hour)
+		{
+			if (bars == null || bars.Count == 0 || idx &lt; 0 || idx &gt;= bars.Count) return false;
+
+			DateTime d = bars.DateTimes[idx].Date;
+
+			// move to start of day
+			int i = idx;
+			while (i &gt; 0 &amp;&amp; bars.DateTimes[i - 1].Date == d) i--;
+
+			// scan that day for the target hour
+			for (int j = i; j &lt; bars.Count &amp;&amp; bars.DateTimes[j].Date == d; j++)
+			{
+				DateTime dt = bars.DateTimes[j];
+				if (dt.Hour == hour &amp;&amp; dt.Minute == 0)
+					return true;
+			}
+			return false;
+		}
+
+		// =========================================================
+		// Trading ops
+		// =========================================================
+		private void OpenLegs(int idx)
+		{
+			_posLong = null;
+			_posShort = null;
+
+			try
+			{
+				Transaction txLong = PlaceTrade(_longBars, TransactionType.Buy, OrderType.MarketClose, 0, _longHash, "LONG_BACK_CALL");
+				if (txLong != null) txLong.Quantity = _contracts;
+
+				Transaction txShort = PlaceTrade(_shortBars, TransactionType.Short, OrderType.MarketClose, 0, _shortHash, "SHORT_FRONT_CALL");
+				if (txShort != null) txShort.Quantity = _contracts;
+
+				_posLong = FindOpenPositionAllSymbols(_longHash);
+				_posShort = FindOpenPositionAllSymbols(_shortHash);
+
+				DLog($"DEBUG | OPEN_LEGS | longPos={(_posLong == null ? "null" : "ok")} shortPos={(_posShort == null ? "null" : "ok")} contracts={_contracts}");
+			}
+			catch (Exception e)
+			{
+				DLog($"WARN | OPEN_LEGS failed: {e.Message}");
+				CloseLegs();
+				ResetState();
+			}
+		}
+
+		private void CloseLegs()
+		{
+			try
+			{
+				if (_posLong == null) _posLong = FindOpenPositionAllSymbols(_longHash);
+				if (_posShort == null) _posShort = FindOpenPositionAllSymbols(_shortHash);
+
+				if (_posLong != null) ClosePosition(_posLong, OrderType.MarketClose, 0, "EXIT_LONG_BACK");
+				if (_posShort != null) ClosePosition(_posShort, OrderType.MarketClose, 0, "EXIT_SHORT_FRONT");
+			}
+			catch (Exception e)
+			{
+				DLog($"WARN | CloseLegs exception: {e.Message}");
+			}
+			finally
+			{
+				_posLong = null;
+				_posShort = null;
+			}
+		}
+
+		private void ResetState()
+		{
+			_inSpread = false;
+			_entryIdx = -1;
+			_exitIdx = -1;
+
+			_longSym = null;
+			_shortSym = null;
+
+			_longBars = null;
+			_shortBars = null;
+
+			_contracts = 0;
+			_entrySpreadMid = double.NaN;
+
+			_longHash = -1;
+			_shortHash = -1;
+
+			_posLong = null;
+			_posShort = null;
+		}
+
+		// =========================================================
+		// Trend + SMA100 alignment (prev trading day)
+		// =========================================================
+		private void BuildDailyTrendUpAndAlignToIntraday(BarHistory intraday)
+		{
+			_trendUpIntraday = new TimeSeries(intraday.DateTimes);
+
+			string ds = TryGetUnderlierDataSetName(intraday);
+			DLog($"INIT | Trend daily load dataset='{ds}' symbol='{intraday.Symbol}'");
+
+			BarHistory daily = null;
+			try
+			{
+				daily = GetHistoryUnsynched(intraday.Symbol, HistoryScale.Daily, ds);
+			}
+			catch (Exception e)
+			{
+				DLog($"WARN | Daily history load failed for trend ({ds}:{intraday.Symbol}) | {e.Message}");
+				return;
+			}
+
+			if (daily == null || daily.Count &lt; (TrendSmaLen + AdxLen + 10))
+			{
+				DLog($"WARN | Daily history insufficient for trend ({ds}:{intraday.Symbol}) | dailyBars={(daily == null ? 0 : daily.Count)}");
+				return;
+			}
+
+			TimeSeries adxD = ADX.Series(daily, AdxLen);
+			TimeSeries smaD = SMA.Series(daily.Close, TrendSmaLen);
+
+			TimeSeries pdiD, mdiD;
+			BuildDmiPlusMinus(daily, AdxLen, out pdiD, out mdiD);
+
+			TimeSeries trendUpDaily = new TimeSeries(daily.DateTimes);
+			for (int i = 0; i &lt; daily.Count; i++)
+			{
+				bool ok =
+					!double.IsNaN(adxD[i]) &amp;&amp; !double.IsNaN(pdiD[i]) &amp;&amp; !double.IsNaN(mdiD[i]) &amp;&amp; !double.IsNaN(smaD[i]) &amp;&amp;
+					(adxD[i] &gt; AdxMin) &amp;&amp; (pdiD[i] &gt; mdiD[i]) &amp;&amp; (daily.Close[i] &gt; smaD[i]);
+
+				trendUpDaily[i] = ok ? 1.0 : 0.0;
+			}
+
+			_trendUpIntraday = AlignDailySeriesToIntraday_PrevTradingDay(intraday, daily, trendUpDaily);
+			DLog($"INIT | Daily TrendUp built+aligned | dailyBars={daily.Count} | intradayBars={intraday.Count}");
+		}
+
+		private void BuildDailySma100AndAlignToIntraday(BarHistory intraday)
+		{
+			string ds = TryGetUnderlierDataSetName(intraday);
+			DLog($"INIT | Daily SMA({DailySma100Len}) load dataset='{ds}' symbol='{intraday.Symbol}'");
+
+			BarHistory daily = null;
+			try
+			{
+				daily = GetHistoryUnsynched(intraday.Symbol, HistoryScale.Daily, ds);
+			}
+			catch (Exception e)
+			{
+				DLog($"WARN | Daily history load failed for SMA({DailySma100Len}) ({ds}:{intraday.Symbol}) | {e.Message}");
+				_dailySma100Intraday = new TimeSeries(intraday.DateTimes);
+				return;
+			}
+
+			if (daily == null || daily.Count &lt; DailySma100Len + 5)
+			{
+				DLog($"WARN | Daily history insufficient for SMA({DailySma100Len}) | dailyBars={(daily == null ? 0 : daily.Count)}");
+				_dailySma100Intraday = new TimeSeries(intraday.DateTimes);
+				return;
+			}
+
+			TimeSeries smaDaily = SMA.Series(daily.Close, DailySma100Len);
+			_dailySma100Intraday = AlignDailySeriesToIntraday_PrevTradingDay(intraday, daily, smaDaily);
+
+			DLog($"INIT | Daily SMA({DailySma100Len}) built+aligned | dailyBars={daily.Count} | intradayBars={intraday.Count}");
+		}
+
+		private static string TryGetUnderlierDataSetName(BarHistory bars)
+		{
+			try
+			{
+				var pi = bars.GetType().GetProperty("DataSetName");
+				if (pi != null)
+				{
+					object v = pi.GetValue(bars, null);
+					if (v is string s &amp;&amp; !string.IsNullOrWhiteSpace(s))
+						return s;
+				}
+			}
+			catch { }
+			return "Data";
+		}
+
+		private bool GetTrendUpIntraday(int idx)
+		{
+			if (_trendUpIntraday == null || idx &lt; 0 || idx &gt;= _trendUpIntraday.Count) return false;
+			double x = _trendUpIntraday[idx];
+			if (double.IsNaN(x)) return false;
+			return x &gt;= 0.5;
+		}
+
+		private static TimeSeries AlignDailySeriesToIntraday_PrevTradingDay(BarHistory intraday, BarHistory daily, TimeSeries dailyValue)
+		{
+			var map = new Dictionary&lt;DateTime, double&gt;(daily.Count);
+			for (int i = 0; i &lt; daily.Count; i++)
+				map[daily.DateTimes[i].Date] = dailyValue[i];
+
+			var uniqueDates = new List&lt;DateTime&gt;(1024);
+			DateTime last = DateTime.MinValue;
+			for (int i = 0; i &lt; intraday.Count; i++)
+			{
+				DateTime d = intraday.DateTimes[i].Date;
+				if (d != last)
+				{
+					uniqueDates.Add(d);
+					last = d;
+				}
+			}
+
+			var prevMap = new Dictionary&lt;DateTime, DateTime&gt;(uniqueDates.Count);
+			for (int i = 0; i &lt; uniqueDates.Count; i++)
+				prevMap[uniqueDates[i]] = (i == 0) ? DateTime.MinValue : uniqueDates[i - 1];
+
+			TimeSeries aligned = new TimeSeries(intraday.DateTimes);
+			for (int i = 0; i &lt; intraday.Count; i++)
+			{
+				DateTime d = intraday.DateTimes[i].Date;
+				DateTime prev = prevMap.TryGetValue(d, out DateTime p) ? p : DateTime.MinValue;
+				aligned[i] = (prev != DateTime.MinValue &amp;&amp; map.TryGetValue(prev, out double v)) ? v : double.NaN;
+			}
+
+			return aligned;
+		}
+
+		// =========================================================
+		// Wilder DMI (+DI / -DI)
+		// =========================================================
+		private static void BuildDmiPlusMinus(BarHistory bars, int len, out TimeSeries pdi, out TimeSeries mdi)
+		{
+			pdi = new TimeSeries(bars.DateTimes);
+			mdi = new TimeSeries(bars.DateTimes);
+
+			int n = bars.Count;
+			if (n &lt; len + 2)
+			{
+				for (int i = 0; i &lt; n; i++) { pdi[i] = double.NaN; mdi[i] = double.NaN; }
+				return;
+			}
+
+			double[] tr = new double[n];
+			double[] plusDM = new double[n];
+			double[] minusDM = new double[n];
+
+			tr[0] = plusDM[0] = minusDM[0] = double.NaN;
+
+			for (int i = 1; i &lt; n; i++)
+			{
+				double prevClose = bars.Close[i - 1];
+
+				double upMove = bars.High[i] - bars.High[i - 1];
+				double downMove = bars.Low[i - 1] - bars.Low[i];
+
+				double pdm = (upMove &gt; downMove &amp;&amp; upMove &gt; 0) ? upMove : 0.0;
+				double mdm = (downMove &gt; upMove &amp;&amp; downMove &gt; 0) ? downMove : 0.0;
+
+				double r1 = bars.High[i] - bars.Low[i];
+				double r2 = Math.Abs(bars.High[i] - prevClose);
+				double r3 = Math.Abs(bars.Low[i] - prevClose);
+
+				tr[i] = Math.Max(r1, Math.Max(r2, r3));
+				plusDM[i] = pdm;
+				minusDM[i] = mdm;
+			}
+
+			double smTR = 0.0, smPDM = 0.0, smMDM = 0.0;
+			int seedEnd = len;
+
+			for (int i = 1; i &lt;= seedEnd; i++)
+			{
+				smTR += tr[i];
+				smPDM += plusDM[i];
+				smMDM += minusDM[i];
+			}
+
+			for (int i = 0; i &lt; seedEnd; i++)
+			{
+				pdi[i] = double.NaN;
+				mdi[i] = double.NaN;
+			}
+
+			if (smTR &gt; 0)
+			{
+				pdi[seedEnd] = 100.0 * (smPDM / smTR);
+				mdi[seedEnd] = 100.0 * (smMDM / smTR);
+			}
+			else
+			{
+				pdi[seedEnd] = double.NaN;
+				mdi[seedEnd] = double.NaN;
+			}
+
+			for (int i = seedEnd + 1; i &lt; n; i++)
+			{
+				smTR = smTR - (smTR / len) + tr[i];
+				smPDM = smPDM - (smPDM / len) + plusDM[i];
+				smMDM = smMDM - (smMDM / len) + minusDM[i];
+
+				if (smTR &gt; 0)
+				{
+					pdi[i] = 100.0 * (smPDM / smTR);
+					mdi[i] = 100.0 * (smMDM / smTR);
+				}
+				else
+				{
+					pdi[i] = double.NaN;
+					mdi[i] = double.NaN;
+				}
+			}
+		}
+
+		// =========================================================
+		// VIX alignment: daily -&gt; intraday using PREV TRADING DAY
+		// =========================================================
+		private Dictionary&lt;DateTime, DateTime&gt; BuildPrevTradingDayMap(BarHistory underlier)
+		{
+			var uniqueDates = new List&lt;DateTime&gt;(1024);
+			DateTime last = DateTime.MinValue;
+
+			for (int i = 0; i &lt; underlier.Count; i++)
+			{
+				DateTime d = underlier.DateTimes[i].Date;
+				if (d != last)
+				{
+					uniqueDates.Add(d);
+					last = d;
+				}
+			}
+
+			var prevMap = new Dictionary&lt;DateTime, DateTime&gt;(uniqueDates.Count);
+			for (int i = 0; i &lt; uniqueDates.Count; i++)
+				prevMap[uniqueDates[i]] = (i == 0) ? DateTime.MinValue : uniqueDates[i - 1];
+
+			return prevMap;
+		}
+
+		private TimeSeries LoadAndAlignDailyVixCloseToIntraday_PrevTradingDay(BarHistory underlier)
+		{
+			BarHistory vixDaily = null;
+			try
+			{
+				vixDaily = GetHistoryUnsynched(VixSymbol, HistoryScale.Daily, CboeDataSetName);
+			}
+			catch (Exception e)
+			{
+				DLog($"WARN | VIX daily history load failed ({CboeDataSetName}:{VixSymbol}) | {e.Message}");
+				return new TimeSeries(underlier.DateTimes);
+			}
+
+			if (vixDaily == null || vixDaily.Count == 0)
+			{
+				DLog($"WARN | VIX daily history empty ({CboeDataSetName}:{VixSymbol})");
+				return new TimeSeries(underlier.DateTimes);
+			}
+
+			var map = new Dictionary&lt;DateTime, double&gt;(vixDaily.Count);
+			for (int j = 0; j &lt; vixDaily.Count; j++)
+				map[vixDaily.DateTimes[j].Date] = vixDaily.Close[j];
+
+			var prevMap = BuildPrevTradingDayMap(underlier);
+
+			TimeSeries aligned = new TimeSeries(underlier.DateTimes);
+			for (int i = 0; i &lt; underlier.Count; i++)
+			{
+				DateTime d = underlier.DateTimes[i].Date;
+				DateTime prev = prevMap.TryGetValue(d, out DateTime p) ? p : DateTime.MinValue;
+				aligned[i] = (prev != DateTime.MinValue &amp;&amp; map.TryGetValue(prev, out double v)) ? v : double.NaN;
+			}
+
+			DLog($"INIT | VIX aligned (daily-&gt;intraday using PREV trading day) | vixDailyBars={vixDaily.Count} | underlierBars={underlier.Count}");
+			return aligned;
+		}
+
+		private TimeSeries BuildIVFromVix(TimeSeries vixAligned, bool carryForward)
+		{
+			TimeSeries iv = new TimeSeries(vixAligned.DateTimes);
+			double lastGoodVix = double.NaN;
+
+			for (int i = 0; i &lt; vixAligned.Count; i++)
+			{
+				double v = vixAligned[i];
+
+				if (double.IsNaN(v))
+				{
+					if (carryForward &amp;&amp; !double.IsNaN(lastGoodVix))
+						v = lastGoodVix;
+					else
+					{
+						iv[i] = double.NaN;
+						continue;
+					}
+				}
+				else
+				{
+					lastGoodVix = v;
+				}
+
+				double ivDec = v / 100.0;
+				if (ivDec &lt; MinIvDec) ivDec = MinIvDec;
+				if (ivDec &gt; MaxIvDec) ivDec = MaxIvDec;
+
+				iv[i] = ivDec;
+			}
+
+			return iv;
+		}
+
+		private static TimeSeries ScaleIvSeries(TimeSeries ivBase, double scale)
+		{
+			if (ivBase == null) return null;
+
+			TimeSeries iv = new TimeSeries(ivBase.DateTimes);
+			for (int i = 0; i &lt; ivBase.Count; i++)
+			{
+				double x = ivBase[i];
+				if (double.IsNaN(x))
+				{
+					iv[i] = double.NaN;
+					continue;
+				}
+
+				double y = x * scale;
+				if (y &lt; MinIvDec) y = MinIvDec;
+				if (y &gt; MaxIvDec) y = MaxIvDec;
+
+				iv[i] = y;
+			}
+			return iv;
+		}
+
+		private double GetAlignedVix(int idx) =&gt; (_vix != null &amp;&amp; idx &gt;= 0 &amp;&amp; idx &lt; _vix.Count) ? _vix[idx] : double.NaN;
+		private double GetIvBaseDec(int idx) =&gt; (_ivBase != null &amp;&amp; idx &gt;= 0 &amp;&amp; idx &lt; _ivBase.Count) ? _ivBase[idx] : double.NaN;
+		private double GetIvFrontDec(int idx) =&gt; (_ivFront != null &amp;&amp; idx &gt;= 0 &amp;&amp; idx &lt; _ivFront.Count) ? _ivFront[idx] : double.NaN;
+		private double GetIvBackDec(int idx) =&gt; (_ivBack != null &amp;&amp; idx &gt;= 0 &amp;&amp; idx &lt; _ivBack.Count) ? _ivBack[idx] : double.NaN;
+
+		// =========================================================
+		// OptionSynthetic histories + caching (FULL underlier always)
+		// =========================================================
+		private BarHistory GetOrCreateOptionHistory(BarHistory underlier, string optionSymbol, bool isBackLeg)
+		{
+			if (string.IsNullOrEmpty(optionSymbol)) return null;
+
+			var cache = isBackLeg ? _optCacheBack : _optCacheFront;
+			if (cache != null &amp;&amp; cache.TryGetValue(optionSymbol, out BarHistory cached))
+				return cached;
+
+			TimeSeries ivSeries = isBackLeg ? _ivBack : _ivFront;
+
+			BarHistory baseUnderlier = _underlierFull ?? underlier;
+
+			BarHistory optBars = OptionSynthetic.GetHistory(baseUnderlier, optionSymbol, ivSeries);
+
+			if (optBars == null || optBars.Count != baseUnderlier.Count)
+			{
+				DLogMaybe(baseUnderlier.Count - 1, baseUnderlier,
+					$"NOQUAL | OptionSynthetic.GetHistory failed/misaligned | leg={(isBackLeg ? "BACK(7DTE)" : "FRONT(1DTE)")} | sym={optionSymbol} | optBars={(optBars == null ? "null" : optBars.Count.ToString())} underlier={baseUnderlier.Count}");
+				return null;
+			}
+
+			cache[optionSymbol] = optBars;
+			return optBars;
+		}
+
+		// =========================================================
+		// Time helpers
+		// =========================================================
+		private static bool IsExactHourBar(DateTime dt, int hour) =&gt; dt.Hour == hour &amp;&amp; dt.Minute == 0;
+
+		private static int GetNextTradingDayHourIndex(BarHistory bars, int idx, int targetHour)
+		{
+			DateTime today = bars.DateTimes[idx].Date;
+
+			int i = idx + 1;
+			while (i &lt; bars.Count &amp;&amp; bars.DateTimes[i].Date == today) i++;
+			if (i &gt;= bars.Count) return -1;
+
+			DateTime nextDay = bars.DateTimes[i].Date;
+
+			for (int j = i; j &lt; bars.Count &amp;&amp; bars.DateTimes[j].Date == nextDay; j++)
+			{
+				DateTime dt = bars.DateTimes[j];
+				if (dt.Hour == targetHour &amp;&amp; dt.Minute == 0)
+					return j;
+			}
+
+			return -1;
+		}
+
+		private static DateTime GetNextTradingDayDate(BarHistory bars, int idx)
+		{
+			DateTime today = bars.DateTimes[idx].Date;
+			int i = idx + 1;
+			while (i &lt; bars.Count &amp;&amp; bars.DateTimes[i].Date == today) i++;
+			return (i &lt; bars.Count) ? bars.DateTimes[i].Date : DateTime.MinValue;
+		}
+
+		private static DateTime GetCalendarDaysThenSnapToNextTradingDay(BarHistory bars, int idx, int calendarDays)
+		{
+			if (idx &lt; 0 || idx &gt;= bars.Count) return DateTime.MinValue;
+
+			DateTime entryDate = bars.DateTimes[idx].Date;
+			DateTime target = entryDate.AddDays(calendarDays);
+
+			for (int i = idx; i &lt; bars.Count; i++)
+			{
+				DateTime d = bars.DateTimes[i].Date;
+				if (d &gt;= target)
+					return d;
+			}
+
+			return DateTime.MinValue;
+		}
+
+		private static double RoundToIncrement(double price, double increment)
+		{
+			if (increment &lt;= 0) return price;
+			return Math.Round(price / increment, MidpointRounding.AwayFromZero) * increment;
+		}
+
+		// =========================================================
+		// Debug
+		// =========================================================
+		private void DLog(string msg)
+		{
+			if (!EnableDebug) return;
+			WriteToDebugLog(msg);
+		}
+
+		private void DLogMaybe(int idx, BarHistory bars, string msg)
+		{
+			if (!EnableDebug) return;
+			if (DebugOnlyLastBar &amp;&amp; idx != bars.Count - 1) return;
+			WriteToDebugLog(msg);
+		}
+	}
+}
+</StrategyData>
+  <LibraryName />
+  <FolderName>meta data</FolderName>
+  <DataSetName>SPY 1 HR;ASCII</DataSetName>
+  <UseSelectedDataSetOnly>false</UseSelectedDataSetOnly>
+  <SingleSymbolMode>false</SingleSymbolMode>
+  <Scale>
+    <Frequency>Minute</Frequency>
+    <Interval>60</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </Scale>
+  <DataRange>
+    <DataRangeType>RecentYears</DataRangeType>
+    <RecentValue>10</RecentValue>
+    <StartDate>0001-01-01T00:00:00</StartDate>
+    <EndDate>0001-01-01T00:00:00</EndDate>
+  </DataRange>
+  <PositionSize>
+    <PositionSizeType>Dollar</PositionSizeType>
+    <Amount>5000</Amount>
+    <PositionSizerName />
+    <PositionSizerParameters />
+    <StartingCapital>100000</StartingCapital>
+    <MarginFactor>1</MarginFactor>
+    <MaxOpenPositions>0</MaxOpenPositions>
+    <MaxOpenPositionsLong>0</MaxOpenPositionsLong>
+    <MaxOpenPositionsShort>0</MaxOpenPositionsShort>
+    <MaxOpenPositionsInSymbol>0</MaxOpenPositionsInSymbol>
+    <UseNextBarOpenAsBasisPrice>false</UseNextBarOpenAsBasisPrice>
+    <StartingCapOptValues>
+      <MinValue>50000</MinValue>
+      <MaxValue>200000</MaxValue>
+      <StepValue>10000</StepValue>
+    </StartingCapOptValues>
+    <FixedAmountOptValues>
+      <MinValue>1000</MinValue>
+      <MaxValue>10000</MaxValue>
+      <StepValue>1000</StepValue>
+    </FixedAmountOptValues>
+    <PctEquityOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>20</MaxValue>
+      <StepValue>1</StepValue>
+    </PctEquityOptValues>
+    <FixedQtyOptValues>
+      <MinValue>100</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>100</StepValue>
+    </FixedQtyOptValues>
+    <MarginOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>2</MaxValue>
+      <StepValue>0.1</StepValue>
+    </MarginOptValues>
+    <MaxRiskOptValues>
+      <MinValue>5</MinValue>
+      <MaxValue>50</MaxValue>
+      <StepValue>5</StepValue>
+    </MaxRiskOptValues>
+    <MaxOpenPosOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>1</StepValue>
+    </MaxOpenPosOptValues>
+    <MaxSignalsPerBar>0</MaxSignalsPerBar>
+    <StartingCapOpt>false</StartingCapOpt>
+    <AmountOpt>false</AmountOpt>
+    <MarginOpt>false</MarginOpt>
+    <MaxOpenPosOpt>false</MaxOpenPosOpt>
+  </PositionSize>
+  <Benchmark>SPY</Benchmark>
+  <SingleSymbol>SPY</SingleSymbol>
+  <RunWithWFOParameters>false</RunWithWFOParameters>
+  <RunWithPreferredValues>false</RunWithPreferredValues>
+  <RetainNSF>true</RetainNSF>
+  <GranularLimitStopScale>
+    <Frequency>Daily</Frequency>
+    <Interval>1</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </GranularLimitStopScale>
+  <UpdateGranularData>true</UpdateGranularData>
+  <IsWLComPublishedStrategy>false</IsWLComPublishedStrategy>
+  <IsWLComUserStrategy>false</IsWLComUserStrategy>
+  <MarkedReadOnly>false</MarkedReadOnly>
+  <IsRunningInEvolver>false</IsRunningInEvolver>
+  <CouldOptimize>false</CouldOptimize>
+  <ParametersEnabled />
+  <IsLinkedToExternalFile>false</IsLinkedToExternalFile>
+  <LinkedFileName />
+  <CompiledStrategyTypeName />
+</Strategy>
