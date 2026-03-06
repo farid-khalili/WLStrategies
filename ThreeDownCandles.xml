@@ -11,7 +11,7 @@
 using WealthLab.Backtest;
 using WealthLab.Core;
 using WealthLab.Indicators;
-
+//this is a modified version
 namespace WealthScript1 
 {
 	public class AVWAP_After_3to4Day_Drop_NoATR : UserStrategyBase
