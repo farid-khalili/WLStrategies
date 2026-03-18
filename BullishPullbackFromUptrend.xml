@@ -16,6 +16,14 @@ namespace WealthScript2
 {
 	public class Drop3Days_LongExitAfter5Days_SignedADXMinus4_Drop3ATRsFilter_MFI14Lag4_Vol3Avg10 : UserStrategyBase
 	{
+		// Runtime-tunable parameter (set in WealthLab UI at run time)
+		public Drop3Days_LongExitAfter5Days_SignedADXMinus4_Drop3ATRsFilter_MFI14Lag4_Vol3Avg10()
+			: base()
+		{
+			// Threshold for: avg(last 3 volumes) / avg(last 10 volumes)
+			AddParameter("Max Avg(3)/Avg(10) Volume Ratio", ParameterType.Double, 1.11, 0.0, 10.0, 0.001);
+		}
+
 		// ===== PARAMETERS =====
 		private const int DropDays = 3;                  // 3 down closes in a row
 		private const int HoldBars = 6;                  // exit after 5 bars
@@ -38,10 +46,11 @@ namespace WealthScript2
 		private const int Mfi14Len = 14;
 		private const double MinMFI14_Lag4 = 68.92;
 
-		// ===== 3-Bar Volume vs Avg10 filter =====
+		// ===== Avg(3) Volume vs Avg(10) filter =====
 		private const int SumBars = 3;
 		private const int VolLookback10 = 10;
-		private const double Max3BarVol_vs_Avg10 = 3.146; // bottom 50% cutoff from DataCruncher
+		// Runtime parameter for the ratio threshold (avg3/avg10).
+		private double _maxAvg3VsAvg10;
 
 		// ===== STATE =====
 		private int _cooldownStartBar = -1;
@@ -71,6 +80,9 @@ namespace WealthScript2
 			_minusDi14 = DIMinus.Series(bars, AdxLen14);
 			_atr14 = ATR.Series(bars, AtrLen);
 			_mfi14 = MFI.Series(bars, Mfi14Len);
+
+			// Parameter[0] is defined in the constructor
+			_maxAvg3VsAvg10 = Parameters[0].AsDouble;
 
 			// Need enough bars for:
 			// - dollar volume
@@ -193,20 +205,11 @@ namespace WealthScript2
 				return;
 
 			// =====================================================
-			// 6) 3BarVol_vs_Avg10 FILTER
-			//
-			// Scorecard concept:
-			// signalBar = EntryBar - 1
-			// numerator = Volume[signalBar] + Volume[signalBar-1] + Volume[signalBar-2]
-			// denominator = average volume of the 10 bars BEFORE those 3 bars
-			//
-			// Since signal bar idx == EntryBar - 1:
-			// numerator   = Volume[idx] + Volume[idx-1] + Volume[idx-2]
-			// denominator = avg volume from bars [idx-4] down to [idx-13]
+			// 6) Avg(3 last candles) vs Avg(10 last candles) FILTER
 			// =====================================================
-			double vol3VsAvg10 = Calc3BarVolVsAvg10(idx, bars);
+			double avg3VsAvg10 = Calc3BarVolVsAvg10(idx, bars);
 
-			if (double.IsNaN(vol3VsAvg10) || vol3VsAvg10 &gt; Max3BarVol_vs_Avg10)
+			if (double.IsNaN(avg3VsAvg10) || avg3VsAvg10 &gt; _maxAvg3VsAvg10)
 				return;
 
 			// =====================================================
@@ -296,26 +299,27 @@ namespace WealthScript2
 
 		private double Calc3BarVolVsAvg10(int idx, BarHistory bars)
 		{
-			if (idx &lt; (SumBars + VolLookback10))
+			// Need at least 10 bars to compute avg(10) using idx..idx-9
+			if (idx &lt; (VolLookback10 - 1))
 				return double.NaN;
 
-			// Numerator: bars idx, idx-1, idx-2
-			double vol3 =
+			// Numerator: avg of the last 3 volumes (idx, idx-1, idx-2)
+			double sum3 =
 				bars.Volume[idx] +
 				bars.Volume[idx - 1] +
 				bars.Volume[idx - 2];
+			double avg3 = sum3 / SumBars;
 
-			// Denominator: average of the 10 bars BEFORE those 3 bars
-			// i.e. idx-4 down to idx-13 inclusive
-			double sum = 0.0;
-			for (int i = 4; i &lt;= 13; i++)
-				sum += bars.Volume[idx - i];
+			// Denominator: avg of the last 10 volumes (idx down to idx-9)
+			double sum10 = 0.0;
+			for (int i = 0; i &lt; VolLookback10; i++)
+				sum10 += bars.Volume[idx - i];
 
-			double avg10 = sum / VolLookback10;
+			double avg10 = sum10 / VolLookback10;
 			if (avg10 &lt;= 0.0 || double.IsNaN(avg10))
 				return double.NaN;
 
-			return vol3 / avg10;
+			return avg3 / avg10;
 		}
 
 		private double CalcDrop3ATRs(int idx, BarHistory bars)
