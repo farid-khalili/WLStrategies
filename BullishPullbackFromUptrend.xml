@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Strategy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <PreferredValues />
-  <ParameterValues />
+  <ParameterValues>
+    <double>1</double>
+  </ParameterValues>
   <Name>BullishPullbackFromUptrend</Name>
   <Description>Enter a description for the Strategy here.</Description>
   <Author>fkhalili</Author>
@@ -12,7 +14,7 @@ using WealthLab.Backtest;
 using WealthLab.Core;
 using WealthLab.Indicators;
 
-namespace WealthScript2
+namespace WealthScript1 
 {
 	public class Drop3Days_LongExitAfter5Days_SignedADXMinus4_Drop3ATRsFilter_MFI14Lag4_Vol3Avg10 : UserStrategyBase
 	{
@@ -21,7 +23,7 @@ namespace WealthScript2
 			: base()
 		{
 			// Threshold for: avg(last 3 volumes) / avg(last 10 volumes)
-			AddParameter("Max Avg(3)/Avg(10) Volume Ratio", ParameterType.Double, 1.11, 0.0, 10.0, 0.001);
+			AddParameter("Max Avg(3)/Avg(10) Volume Ratio", ParameterType.Double, 1.0, 0.0, 10.0, 0.001);
 		}
 
 		// ===== PARAMETERS =====
@@ -344,9 +346,10 @@ namespace WealthScript2
 			return drop / atrVal;
 		}
 	}
-}</StrategyData>
+}
+//this is a test</StrategyData>
   <LibraryName />
-  <FolderName>OmniTradeBeta</FolderName>
+  <FolderName>Pullback Strategy</FolderName>
   <DataSetName>S&amp;P 500;WealthData</DataSetName>
   <UseSelectedDataSetOnly>false</UseSelectedDataSetOnly>
   <SingleSymbolMode>false</SingleSymbolMode>
@@ -357,7 +360,7 @@ namespace WealthScript2
   </Scale>
   <DataRange>
     <DataRangeType>RecentYears</DataRangeType>
-    <RecentValue>2</RecentValue>
+    <RecentValue>27</RecentValue>
     <StartDate>0001-01-01T00:00:00</StartDate>
     <EndDate>0001-01-01T00:00:00</EndDate>
   </DataRange>
@@ -429,7 +432,7 @@ namespace WealthScript2
   <IsWLComUserStrategy>false</IsWLComUserStrategy>
   <MarkedReadOnly>false</MarkedReadOnly>
   <IsRunningInEvolver>false</IsRunningInEvolver>
-  <CouldOptimize>false</CouldOptimize>
+  <CouldOptimize>true</CouldOptimize>
   <ParametersEnabled />
   <IsLinkedToExternalFile>false</IsLinkedToExternalFile>
   <LinkedFileName />
