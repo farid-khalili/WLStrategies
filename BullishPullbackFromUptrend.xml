@@ -23,7 +23,7 @@ namespace WealthScript1
 			: base()
 		{
 			// Threshold for: avg(last 3 volumes) / avg(last 10 volumes)
-			AddParameter("Max Avg(3)/Avg(10) Volume Ratio", ParameterType.Double, 1.0, 0.0, 10.0, 0.001);
+			AddParameter("Max Avg(3)/Avg(10) Volume Ratio", ParameterType.Double, 1.11, 0.0, 10.0, 0.001);
 		}
 
 		// ===== PARAMETERS =====
