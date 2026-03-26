@@ -1,0 +1,564 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Strategy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <PreferredValues />
+  <ParameterValues />
+  <Name>Bullishpullback Volume Requirement</Name>
+  <Description>Enter a description for the Strategy here.</Description>
+  <Author>fkhalili</Author>
+  <CreationDate>2026-03-26T12:25:32.4886531-04:00</CreationDate>
+  <StrategyType>Code</StrategyType>
+  <StrategyData>using System;
+using WealthLab.Backtest;
+using WealthLab.Core;
+using WealthLab.Indicators;
+
+namespace WealthScript1
+{
+	public class Drop3Days_LongExitAfter5Days_SignedADXMinus4_Drop3ATRsFilter_MFI14Lag4_RSI3_MFI14Ref_YRangePosYHigh : UserStrategyBase
+	{
+		// ===== PARAMETERS =====
+		private const int DropDays = 3;                  // 3 down closes in a row
+		private const int HoldBars = 6;                  // exit after 5 bars
+		private const int CooldownBars = 10;             // wait this many bars after entry before re-arming
+
+		// ===== FILTERS =====
+		private const double MinPrice = 5.0;             // min $5 stock
+		private const int DvLen = 20;                    // avg dollar volume lookback
+		private const double MinAvgDollarVol = 500000.0; // $500k/day
+
+		// ===== DataCruncher filters =====
+		private const int AdxLen14 = 14;
+		private const int LookbackBars = 4;
+		private const double MinSignedADX14_Minus4 = 26.34;
+
+		private const int AtrLen = 14;
+		private const double MinDrop3ATRs = 1.0;
+
+		// ===== MFI filters =====
+		private const int Mfi14Len = 14;
+		private const double MinMFI14_Lag4 = 68.92;
+		private const double MinMFI14_RefBar = 53.0992;
+
+		// ===== RSI filter =====
+		private const int Rsi3Len = 3;
+		private const double MaxRSI3_RefBar = 27.6931;
+
+		// ===== Yesterday-vs-PriorDay filter =====
+		private const double MaxYRangePos_YHigh = 73.0832;
+		private const double MinRangeAsAtr_ForPos = 0.10;
+
+		// ===== STATE =====
+		private int _cooldownStartBar = -1;
+
+		// ===== SERIES =====
+		private TimeSeries _dollarVol;
+		private TimeSeries _avgDollarVol;
+
+		private TimeSeries _adx14;
+		private TimeSeries _plusDi14;
+		private TimeSeries _minusDi14;
+		private TimeSeries _atr14;
+		private TimeSeries _mfi14;
+		private TimeSeries _rsi3;
+
+		public override void Initialize(BarHistory bars)
+		{
+			// DollarVol = Close * Volume
+			_dollarVol = new TimeSeries(bars.DateTimes, true);
+			for (int i = 0; i &lt; bars.Count; i++)
+				_dollarVol[i] = bars.Close[i] * bars.Volume[i];
+
+			_avgDollarVol = SMA.Series(_dollarVol, DvLen);
+
+			// Cached indicators
+			_adx14 = ADX.Series(bars, AdxLen14);
+			_plusDi14 = DIPlus.Series(bars, AdxLen14);
+			_minusDi14 = DIMinus.Series(bars, AdxLen14);
+			_atr14 = ATR.Series(bars, AtrLen);
+			_mfi14 = MFI.Series(bars, Mfi14Len);
+			_rsi3 = RSI.Series(bars.Close, Rsi3Len);
+
+			// Need enough bars for:
+			// - dollar volume
+			// - 3-down pattern
+			// - ADX minus-4 lookback
+			// - ATR-based drop filter
+			// - MFI14 minus-4 lookback
+			// - RSI3
+			// - yesterday vs prior day calculations
+			StartIndex = Math.Max(
+				Math.Max(DvLen + 2, DropDays + 2),
+				Math.Max(
+					Math.Max(
+						Math.Max(AdxLen14 + LookbackBars + 2, AtrLen + 3),
+						Mfi14Len + LookbackBars + 2
+					),
+					Math.Max(Rsi3Len + 2, 5)
+				)
+			);
+		}
+
+		public override void Execute(BarHistory bars, int idx)
+		{
+			if (idx &lt; StartIndex)
+				return;
+
+			// =====================================================
+			// 1) EXIT: after HoldBars bars
+			// =====================================================
+			for (int i = OpenPositions.Count - 1; i &gt;= 0; i--)
+			{
+				Position pos = OpenPositions[i];
+				if (pos.PositionType != PositionType.Long)
+					continue;
+
+				int barsHeld = idx - pos.EntryBar;
+				if (barsHeld &gt;= HoldBars)
+				{
+					int tag = (pos.Tag is int t) ? t : -1;
+
+					Transaction txExit = PlaceTrade(
+						bars,
+						TransactionType.Sell,
+						OrderType.Market,
+						pos.Quantity,
+						tag
+					);
+
+					if (txExit != null)
+						txExit.SignalName = "EXIT_5BARS";
+				}
+			}
+
+			// =====================================================
+			// 2) COOLDOWN
+			// =====================================================
+			if (_cooldownStartBar &lt; 0 &amp;&amp; OpenPositions.Count &gt; 0)
+			{
+				Position p = OpenPositions[0];
+				if (p.EntryBar &gt;= 0)
+					_cooldownStartBar = p.EntryBar;
+			}
+
+			if (_cooldownStartBar &gt;= 0)
+			{
+				if (!HasOpenPosition(bars, PositionType.Long) &amp;&amp;
+					(idx - _cooldownStartBar) &gt;= CooldownBars)
+				{
+					_cooldownStartBar = -1;
+				}
+				else
+				{
+					return;
+				}
+			}
+
+			// If still long, don't look for new entries
+			if (HasOpenPosition(bars, PositionType.Long))
+				return;
+
+			// =====================================================
+			// 3) BASIC ENTRY FILTERS
+			// =====================================================
+			if (bars.Close[idx] &lt; MinPrice)
+				return;
+
+			double adv = _avgDollarVol[idx];
+			if (double.IsNaN(adv) || adv &lt; MinAvgDollarVol)
+				return;
+
+			// =====================================================
+			// 4) SIGNED ADX FILTER (Minus4)
+			// signal bar idx == EntryBar - 1
+			// so use idx - 4
+			// =====================================================
+			int minus4Bar = idx - LookbackBars;
+			double signedAdx14Minus4 = GetSignedAdxFromCached(minus4Bar);
+
+			if (double.IsNaN(signedAdx14Minus4) || signedAdx14Minus4 &lt; MinSignedADX14_Minus4)
+				return;
+
+			// =====================================================
+			// 5) MFI14_Lag4 FILTER
+			// signal bar idx == EntryBar - 1
+			// so use idx - 4
+			// =====================================================
+			double mfi14Lag4 = GetMfiValue(minus4Bar);
+
+			if (double.IsNaN(mfi14Lag4) || mfi14Lag4 &lt; MinMFI14_Lag4)
+				return;
+
+			// =====================================================
+			// 6) MFI14 reference-bar FILTER
+			// MFI14_abv_53.0992 on the reference bar
+			// =====================================================
+			double mfi14Ref = GetMfiValue(idx);
+
+			if (double.IsNaN(mfi14Ref) || mfi14Ref &lt; MinMFI14_RefBar)
+				return;
+
+			// =====================================================
+			// 7) RSI3 reference-bar FILTER
+			// RSI3_blw_27.6931 on the reference bar
+			// =====================================================
+			double rsi3Ref = GetRsi3Value(idx);
+
+			if (double.IsNaN(rsi3Ref) || rsi3Ref &gt;= MaxRSI3_RefBar)
+				return;
+
+			// =====================================================
+			// 8) YRangePos_YHigh FILTER
+			// Scorecard concept:
+			// signal bar = EntryBar - 1 = idx
+			// yesterday   = signal bar's session
+			// prior day   = session immediately before yesterday
+			// =====================================================
+			double yRangePosYHigh = CalcYRangePosYHigh(idx, bars);
+
+			if (double.IsNaN(yRangePosYHigh) || yRangePosYHigh &gt;= MaxYRangePos_YHigh)
+				return;
+
+			// =====================================================
+			// 9) ENTRY PATTERN: 3 consecutive down closes ending at idx
+			// =====================================================
+			bool allDown = true;
+			for (int k = idx - DropDays + 1; k &lt;= idx; k++)
+			{
+				if (bars.Close[k] &gt;= bars.Close[k - 1])
+				{
+					allDown = false;
+					break;
+				}
+			}
+			if (!allDown)
+				return;
+
+			// =====================================================
+			// 10) Drop3_ATRs FILTER
+			//
+			// Since signal bar idx == entryBar - 1:
+			// firstBar = idx - 2
+			// lastBar  = idx
+			//
+			// Drop3_ATRs = (Open[firstBar] - Close[lastBar]) / ATR[lastBar]
+			// =====================================================
+			double drop3ATRs = CalcDrop3ATRs(idx, bars);
+
+			if (double.IsNaN(drop3ATRs) || drop3ATRs &lt; MinDrop3ATRs)
+				return;
+
+			// Anchor bar = first bar before the 3-down sequence begins
+			int anchorBar = idx - DropDays;
+
+			Transaction txEntry = PlaceTrade(
+				bars,
+				TransactionType.Buy,
+				OrderType.Market,
+				0,
+				anchorBar
+			);
+
+			if (txEntry != null)
+				txEntry.SignalName = "ENTRY_3DOWN_ADX14M4_MFI14L4_MFI14REF_RSI3_YRANGEPOSYHIGH_DROP3ATR";
+		}
+
+		private double GetSignedAdxFromCached(int barIndex)
+		{
+			if (_adx14 == null || _plusDi14 == null || _minusDi14 == null)
+				return double.NaN;
+
+			if (barIndex &lt; 0 || barIndex &gt;= _adx14.Count)
+				return double.NaN;
+
+			double adxVal = _adx14[barIndex];
+			double plusVal = _plusDi14[barIndex];
+			double minusVal = _minusDi14[barIndex];
+
+			if (double.IsNaN(adxVal) || double.IsNaN(plusVal) || double.IsNaN(minusVal))
+				return double.NaN;
+
+			if (plusVal &gt; minusVal)
+				return adxVal;
+
+			if (minusVal &gt; plusVal)
+				return -adxVal;
+
+			return 0.0;
+		}
+
+		private double GetMfiValue(int barIndex)
+		{
+			if (_mfi14 == null)
+				return double.NaN;
+
+			if (barIndex &lt; 0 || barIndex &gt;= _mfi14.Count)
+				return double.NaN;
+
+			double val = _mfi14[barIndex];
+			return double.IsNaN(val) ? double.NaN : val;
+		}
+
+		private double GetRsi3Value(int barIndex)
+		{
+			if (_rsi3 == null)
+				return double.NaN;
+
+			if (barIndex &lt; 0 || barIndex &gt;= _rsi3.Count)
+				return double.NaN;
+
+			double val = _rsi3[barIndex];
+			return double.IsNaN(val) ? double.NaN : val;
+		}
+
+		private double CalcDrop3ATRs(int idx, BarHistory bars)
+		{
+			if (_atr14 == null)
+				return double.NaN;
+
+			if (idx &lt; 2 || idx &gt;= bars.Count)
+				return double.NaN;
+
+			int firstBar = idx - 2;
+			int lastBar = idx;
+
+			double firstOpen = bars.Open[firstBar];
+			double lastClose = bars.Close[lastBar];
+			double atrVal = _atr14[lastBar];
+
+			if (double.IsNaN(firstOpen) || double.IsNaN(lastClose) || double.IsNaN(atrVal) || atrVal &lt;= 0)
+				return double.NaN;
+
+			double drop = firstOpen - lastClose;
+			return drop / atrVal;
+		}
+
+		private double CalcYRangePosYHigh(int signalIdx, BarHistory bars)
+		{
+			if (_atr14 == null)
+				return double.NaN;
+
+			if (signalIdx &lt; 1 || signalIdx &gt;= bars.Count)
+				return double.NaN;
+
+			// "Yesterday" = the session containing signalIdx
+			if (!TryGetSessionHighLowClose(
+				bars,
+				signalIdx,
+				out DateTime yDate,
+				out double yHigh,
+				out double yLow,
+				out double yClose))
+				return double.NaN;
+
+			int yLastIdx = FindLastBarOfSession(bars, yDate);
+			if (yLastIdx &lt; 0)
+				return double.NaN;
+
+			double a = _atr14[yLastIdx];
+			if (double.IsNaN(a) || a &lt;= 0)
+				return double.NaN;
+
+			// Prior session = day before yesterday
+			if (!TryGetPriorSessionHighLowBeforeDate(bars, yDate, out double pHigh, out double pLow))
+				return double.NaN;
+
+			double pRange = pHigh - pLow;
+			if (pRange &lt;= 0)
+				return double.NaN;
+
+			if (pRange &lt; MinRangeAsAtr_ForPos * a)
+				return double.NaN;
+
+			return (yHigh - pLow) / pRange * 100.0;
+		}
+
+		private static bool TryGetSessionHighLowClose(
+			BarHistory bars,
+			int idx,
+			out DateTime sessionDate,
+			out double sessionHigh,
+			out double sessionLow,
+			out double sessionClose)
+		{
+			sessionDate = DateTime.MinValue;
+			sessionHigh = double.NaN;
+			sessionLow = double.NaN;
+			sessionClose = double.NaN;
+
+			if (idx &lt; 0 || idx &gt;= bars.Count)
+				return false;
+
+			sessionDate = bars.DateTimes[idx].Date;
+
+			int first = idx;
+			while (first &gt; 0 &amp;&amp; bars.DateTimes[first - 1].Date == sessionDate)
+				first--;
+
+			int last = idx;
+			while (last + 1 &lt; bars.Count &amp;&amp; bars.DateTimes[last + 1].Date == sessionDate)
+				last++;
+
+			sessionHigh = double.MinValue;
+			sessionLow = double.MaxValue;
+
+			for (int i = first; i &lt;= last; i++)
+			{
+				if (bars.High[i] &gt; sessionHigh) sessionHigh = bars.High[i];
+				if (bars.Low[i] &lt; sessionLow) sessionLow = bars.Low[i];
+			}
+
+			sessionClose = bars.Close[last];
+
+			if (sessionHigh == double.MinValue || sessionLow == double.MaxValue)
+				return false;
+
+			return true;
+		}
+
+		private static int FindLastBarOfSession(BarHistory bars, DateTime sessionDate)
+		{
+			for (int i = bars.Count - 1; i &gt;= 0; i--)
+			{
+				if (bars.DateTimes[i].Date == sessionDate)
+					return i;
+			}
+
+			return -1;
+		}
+
+		private static bool TryGetPriorSessionHighLowBeforeDate(
+			BarHistory bars,
+			DateTime targetDate,
+			out double priorHigh,
+			out double priorLow)
+		{
+			priorHigh = double.NaN;
+			priorLow = double.NaN;
+
+			int j = -1;
+
+			for (int i = bars.Count - 1; i &gt;= 0; i--)
+			{
+				if (bars.DateTimes[i].Date &lt; targetDate)
+				{
+					j = i;
+					break;
+				}
+			}
+
+			if (j &lt; 0)
+				return false;
+
+			DateTime priorDate = bars.DateTimes[j].Date;
+
+			priorHigh = double.MinValue;
+			priorLow = double.MaxValue;
+
+			while (j &gt;= 0 &amp;&amp; bars.DateTimes[j].Date == priorDate)
+			{
+				double h = bars.High[j];
+				double l = bars.Low[j];
+
+				if (h &gt; priorHigh) priorHigh = h;
+				if (l &lt; priorLow) priorLow = l;
+
+				j--;
+			}
+
+			if (priorHigh == double.MinValue || priorLow == double.MaxValue)
+				return false;
+
+			return true;
+		}
+	}
+}</StrategyData>
+  <LibraryName />
+  <FolderName>Used</FolderName>
+  <DataSetName>S&amp;P 500;WealthData</DataSetName>
+  <UseSelectedDataSetOnly>false</UseSelectedDataSetOnly>
+  <SingleSymbolMode>false</SingleSymbolMode>
+  <Scale>
+    <Frequency>Daily</Frequency>
+    <Interval>1</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </Scale>
+  <DataRange>
+    <DataRangeType>RecentYears</DataRangeType>
+    <RecentValue>27</RecentValue>
+    <StartDate>0001-01-01T00:00:00</StartDate>
+    <EndDate>0001-01-01T00:00:00</EndDate>
+  </DataRange>
+  <PositionSize>
+    <PositionSizeType>Dollar</PositionSizeType>
+    <Amount>2000</Amount>
+    <PositionSizerName />
+    <PositionSizerParameters />
+    <StartingCapital>610000</StartingCapital>
+    <MarginFactor>1</MarginFactor>
+    <MaxOpenPositions>220</MaxOpenPositions>
+    <MaxOpenPositionsLong>0</MaxOpenPositionsLong>
+    <MaxOpenPositionsShort>0</MaxOpenPositionsShort>
+    <MaxOpenPositionsInSymbol>0</MaxOpenPositionsInSymbol>
+    <UseNextBarOpenAsBasisPrice>true</UseNextBarOpenAsBasisPrice>
+    <StartingCapOptValues>
+      <MinValue>50000</MinValue>
+      <MaxValue>200000</MaxValue>
+      <StepValue>10000</StepValue>
+    </StartingCapOptValues>
+    <FixedAmountOptValues>
+      <MinValue>1000</MinValue>
+      <MaxValue>10000</MaxValue>
+      <StepValue>1000</StepValue>
+    </FixedAmountOptValues>
+    <PctEquityOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>20</MaxValue>
+      <StepValue>1</StepValue>
+    </PctEquityOptValues>
+    <FixedQtyOptValues>
+      <MinValue>100</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>100</StepValue>
+    </FixedQtyOptValues>
+    <MarginOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>2</MaxValue>
+      <StepValue>0.1</StepValue>
+    </MarginOptValues>
+    <MaxRiskOptValues>
+      <MinValue>5</MinValue>
+      <MaxValue>50</MaxValue>
+      <StepValue>5</StepValue>
+    </MaxRiskOptValues>
+    <MaxOpenPosOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>1</StepValue>
+    </MaxOpenPosOptValues>
+    <MaxSignalsPerBar>0</MaxSignalsPerBar>
+    <StartingCapOpt>false</StartingCapOpt>
+    <AmountOpt>false</AmountOpt>
+    <MarginOpt>false</MarginOpt>
+    <MaxOpenPosOpt>false</MaxOpenPosOpt>
+  </PositionSize>
+  <Benchmark>SPY</Benchmark>
+  <SingleSymbol>SPY</SingleSymbol>
+  <RunWithWFOParameters>false</RunWithWFOParameters>
+  <RunWithPreferredValues>false</RunWithPreferredValues>
+  <RetainNSF>true</RetainNSF>
+  <GranularLimitStopScale>
+    <Frequency>Daily</Frequency>
+    <Interval>1</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </GranularLimitStopScale>
+  <UpdateGranularData>true</UpdateGranularData>
+  <IsWLComPublishedStrategy>false</IsWLComPublishedStrategy>
+  <IsWLComUserStrategy>false</IsWLComUserStrategy>
+  <MarkedReadOnly>false</MarkedReadOnly>
+  <IsRunningInEvolver>false</IsRunningInEvolver>
+  <CouldOptimize>false</CouldOptimize>
+  <ParametersEnabled />
+  <IsLinkedToExternalFile>false</IsLinkedToExternalFile>
+  <LinkedFileName />
+  <CompiledStrategyTypeName />
+</Strategy>

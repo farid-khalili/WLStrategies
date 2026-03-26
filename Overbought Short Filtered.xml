@@ -1,0 +1,317 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Strategy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <PreferredValues />
+  <ParameterValues />
+  <Name>Overbought Short Filtered</Name>
+  <Description>Enter a description for the Strategy here.</Description>
+  <Author>fkhalili</Author>
+  <CreationDate>2026-03-23T01:42:26.1025874-04:00</CreationDate>
+  <StrategyType>Code</StrategyType>
+  <StrategyData>using System;
+using WealthLab.Backtest;
+using WealthLab.Core;
+using WealthLab.Indicators;
+
+namespace WealthScript1
+{
+	public class Short_3UpCloses_RSI3Overbought_Hold5Bars : UserStrategyBase
+	{
+		// ===== PARAMETERS =====
+		private const int UpDays = 3;
+		private const int HoldBars = 5;
+		private const int CooldownBars = 5;
+
+		// ===== STANDARD LIQUIDITY FILTERS =====
+		private const double MinPrice = 5.0;
+		private const int DollarVolLen = 20;
+		private const double MinAvgDollarVol = 500000.0;
+
+		// ===== SIGNAL FILTERS =====
+		private const int RsiLen = 3;
+		private const double MinRSI3 = 85.0;
+
+		// ===== ADDED FILTERS =====
+		private const int Rsi90Len = 90;
+		private const int Atr20Len = 20;
+		private const int Atr100Len = 100;
+
+		// "Minus4 from entry bar"
+		// Entry happens on idx + 1
+		// So 4 bars before entry = (idx + 1) - 4 = idx - 3
+		private const int Rsi90OffsetFromIdx = 3;
+		private const double MaxRSI90Lag4 = 49.9283;
+
+		private const double MinATR20Pct = 0.0609507;
+		private const double MinATR20ATR100 = 0.953653;
+
+		// ===== SERIES =====
+		private TimeSeries _dollarVol;
+		private TimeSeries _avgDollarVol;
+		private TimeSeries _rsi3;
+		private TimeSeries _rsi90;
+		private TimeSeries _atr20;
+		private TimeSeries _atr100;
+
+		// ===== STATE =====
+		private int _cooldownStartBar = -1;
+
+		public override void Initialize(BarHistory bars)
+		{
+			_dollarVol = new TimeSeries(bars.DateTimes, true);
+			for (int i = 0; i &lt; bars.Count; i++)
+				_dollarVol[i] = bars.Close[i] * bars.Volume[i];
+
+			_avgDollarVol = SMA.Series(_dollarVol, DollarVolLen);
+			_rsi3 = RSI.Series(bars.Close, RsiLen);
+			_rsi90 = RSI.Series(bars.Close, Rsi90Len);
+			_atr20 = ATR.Series(bars, Atr20Len);
+			_atr100 = ATR.Series(bars, Atr100Len);
+
+			// Need enough bars for:
+			// - 20-bar avg dollar volume
+			// - RSI(3)
+			// - 3 up closes ending on idx, which requires idx-3 to exist
+			// - RSI(90) at idx-3
+			// - ATR(100)
+			StartIndex = Math.Max(
+				Math.Max(DollarVolLen, RsiLen + UpDays),
+				Math.Max(Rsi90Len + Rsi90OffsetFromIdx, Atr100Len)
+			);
+		}
+
+		public override void Execute(BarHistory bars, int idx)
+		{
+			if (idx &lt; StartIndex)
+				return;
+
+			// =====================================================
+			// 1) EXITS
+			// =====================================================
+			for (int i = OpenPositions.Count - 1; i &gt;= 0; i--)
+			{
+				Position pos = OpenPositions[i];
+				if (pos.PositionType != PositionType.Short)
+					continue;
+
+				int barsHeld = idx - pos.EntryBar;
+				if (barsHeld &gt;= HoldBars)
+				{
+					int tag = (pos.Tag is int t) ? t : -1;
+
+					Transaction txExit = PlaceTrade(
+						bars,
+						TransactionType.Cover,
+						OrderType.Market,
+						pos.Quantity,
+						tag
+					);
+
+					if (txExit != null)
+						txExit.SignalName = "EXIT_5BARS";
+				}
+			}
+
+			// =====================================================
+			// 2) COOLDOWN
+			// =====================================================
+			if (_cooldownStartBar &lt; 0 &amp;&amp; OpenPositions.Count &gt; 0)
+			{
+				Position p = OpenPositions[0];
+				if (p.EntryBar &gt;= 0)
+					_cooldownStartBar = p.EntryBar;
+			}
+
+			if (_cooldownStartBar &gt;= 0)
+			{
+				if (!HasOpenPosition(bars, PositionType.Short) &amp;&amp;
+					(idx - _cooldownStartBar) &gt;= CooldownBars)
+				{
+					_cooldownStartBar = -1;
+				}
+				else
+				{
+					return;
+				}
+			}
+
+			// If already short, do not look for new entries
+			if (HasOpenPosition(bars, PositionType.Short))
+				return;
+
+			// =====================================================
+			// 3) SIGNAL BAR LOGIC
+			// Decisions are evaluated on idx
+			// Entry occurs at the open of idx + 1
+			// =====================================================
+			if (idx &lt; 3)
+				return;
+
+			// =====================================================
+			// 4) LIQUIDITY FILTERS ON idx
+			// =====================================================
+			if (bars.Close[idx] &lt; MinPrice)
+				return;
+
+			double adv = _avgDollarVol[idx];
+			if (double.IsNaN(adv) || adv &lt; MinAvgDollarVol)
+				return;
+
+			// =====================================================
+			// 5) RSI3 OVERBOUGHT FILTER ON idx
+			// =====================================================
+			double rsi3 = _rsi3[idx];
+			if (double.IsNaN(rsi3) || rsi3 &lt;= MinRSI3)
+				return;
+
+			// =====================================================
+			// 6) ADDED FILTERS ON idx
+			// =====================================================
+
+			// RSI90_Minus4_blw_49.9283_filtered
+			// 4 bars before entry bar = idx - 3
+			double rsi90Lag4 = _rsi90[idx - Rsi90OffsetFromIdx];
+			if (double.IsNaN(rsi90Lag4) || rsi90Lag4 &gt;= MaxRSI90Lag4)
+				return;
+
+			// ATR20_pct_abv_0.0609507_filtered
+			double atr20 = _atr20[idx];
+			double close = bars.Close[idx];
+			if (double.IsNaN(atr20) || close &lt;= 0.0)
+				return;
+
+			double atr20Pct = atr20 / close;
+			if (atr20Pct &lt;= MinATR20Pct)
+				return;
+
+			// ATR20_ATR100_abv_0.953653_filtered
+			double atr100 = _atr100[idx];
+			if (double.IsNaN(atr100) || atr100 &lt;= 0.0)
+				return;
+
+			double atr20Atr100 = atr20 / atr100;
+			if (atr20Atr100 &lt;= MinATR20ATR100)
+				return;
+
+			// =====================================================
+			// 7) 3 CONSECUTIVE UP CLOSES ENDING ON idx
+			// idx-2, idx-1, idx each closed above prior close
+			// =====================================================
+			bool allUp = true;
+			for (int k = idx - UpDays + 1; k &lt;= idx; k++)
+			{
+				if (bars.Close[k] &lt;= bars.Close[k - 1])
+				{
+					allUp = false;
+					break;
+				}
+			}
+
+			if (!allUp)
+				return;
+
+			// Anchor bar = bar before 3-up sequence started
+			int anchorBar = idx - UpDays;
+
+			Transaction txEntry = PlaceTrade(
+				bars,
+				TransactionType.Short,
+				OrderType.Market,
+				0,
+				anchorBar
+			);
+
+			if (txEntry != null)
+				txEntry.SignalName = "ENTRY_3UP_RSI3_OVERBOUGHT_FILTERED";
+		}
+	}
+}</StrategyData>
+  <LibraryName />
+  <FolderName>Used</FolderName>
+  <DataSetName>S&amp;P 500;WealthData</DataSetName>
+  <UseSelectedDataSetOnly>false</UseSelectedDataSetOnly>
+  <SingleSymbolMode>false</SingleSymbolMode>
+  <Scale>
+    <Frequency>Daily</Frequency>
+    <Interval>1</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </Scale>
+  <DataRange>
+    <DataRangeType>RecentYears</DataRangeType>
+    <RecentValue>27</RecentValue>
+    <StartDate>0001-01-01T00:00:00</StartDate>
+    <EndDate>0001-01-01T00:00:00</EndDate>
+  </DataRange>
+  <PositionSize>
+    <PositionSizeType>Dollar</PositionSizeType>
+    <Amount>2000</Amount>
+    <PositionSizerName />
+    <PositionSizerParameters />
+    <StartingCapital>610000</StartingCapital>
+    <MarginFactor>1</MarginFactor>
+    <MaxOpenPositions>220</MaxOpenPositions>
+    <MaxOpenPositionsLong>0</MaxOpenPositionsLong>
+    <MaxOpenPositionsShort>0</MaxOpenPositionsShort>
+    <MaxOpenPositionsInSymbol>0</MaxOpenPositionsInSymbol>
+    <UseNextBarOpenAsBasisPrice>true</UseNextBarOpenAsBasisPrice>
+    <StartingCapOptValues>
+      <MinValue>50000</MinValue>
+      <MaxValue>200000</MaxValue>
+      <StepValue>10000</StepValue>
+    </StartingCapOptValues>
+    <FixedAmountOptValues>
+      <MinValue>1000</MinValue>
+      <MaxValue>10000</MaxValue>
+      <StepValue>1000</StepValue>
+    </FixedAmountOptValues>
+    <PctEquityOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>20</MaxValue>
+      <StepValue>1</StepValue>
+    </PctEquityOptValues>
+    <FixedQtyOptValues>
+      <MinValue>100</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>100</StepValue>
+    </FixedQtyOptValues>
+    <MarginOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>2</MaxValue>
+      <StepValue>0.1</StepValue>
+    </MarginOptValues>
+    <MaxRiskOptValues>
+      <MinValue>5</MinValue>
+      <MaxValue>50</MaxValue>
+      <StepValue>5</StepValue>
+    </MaxRiskOptValues>
+    <MaxOpenPosOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>1</StepValue>
+    </MaxOpenPosOptValues>
+    <MaxSignalsPerBar>0</MaxSignalsPerBar>
+    <StartingCapOpt>false</StartingCapOpt>
+    <AmountOpt>false</AmountOpt>
+    <MarginOpt>false</MarginOpt>
+    <MaxOpenPosOpt>false</MaxOpenPosOpt>
+  </PositionSize>
+  <Benchmark>SPY</Benchmark>
+  <SingleSymbol>SPY</SingleSymbol>
+  <RunWithWFOParameters>false</RunWithWFOParameters>
+  <RunWithPreferredValues>false</RunWithPreferredValues>
+  <RetainNSF>true</RetainNSF>
+  <GranularLimitStopScale>
+    <Frequency>Daily</Frequency>
+    <Interval>1</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </GranularLimitStopScale>
+  <UpdateGranularData>true</UpdateGranularData>
+  <IsWLComPublishedStrategy>false</IsWLComPublishedStrategy>
+  <IsWLComUserStrategy>false</IsWLComUserStrategy>
+  <MarkedReadOnly>false</MarkedReadOnly>
+  <IsRunningInEvolver>false</IsRunningInEvolver>
+  <CouldOptimize>false</CouldOptimize>
+  <ParametersEnabled />
+  <IsLinkedToExternalFile>false</IsLinkedToExternalFile>
+  <LinkedFileName />
+  <CompiledStrategyTypeName />
+</Strategy>

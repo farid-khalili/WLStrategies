@@ -1,0 +1,856 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Strategy xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <PreferredValues />
+  <ParameterValues />
+  <Name>Morning Payout Bid Ask</Name>
+  <Description>Enter a description for the Strategy here.</Description>
+  <Author>fkhalili</Author>
+  <CreationDate>2026-03-25T22:19:09.5826018-04:00</CreationDate>
+  <StrategyType>Code</StrategyType>
+  <StrategyData>using System;
+using System.Collections.Generic;
+using System.Globalization;
+using WealthLab.Backtest;
+using WealthLab.Core;
+using WealthLab.Data;
+
+namespace WealthScript2 
+{
+	public class ThetaData_Primary_ATM_1DTE_Call_300PM_to_11AM_Debug : UserStrategyBase
+	{
+		private const double StrikeTolerance = 0.0001;
+		private const double MaxEntryBarOpenClosePct = .90;
+
+		private const string SpyUnderlyingDataSet = "SPY";
+
+		private BarHistory _spyBarsSync;
+		private BarHistory _spyBarsRaw;
+
+		private static int _nextPairTag = 1;
+		private static bool _sharedStateInitialized = false;
+		private static readonly object _stateLock = new object();
+
+		private sealed class TrackedLegState
+		{
+			public int PairTag;
+			public DateTime SignalDateTime;
+			public bool ExitOrderPlaced;
+			public bool IsLongLeg;   // true = long leg, false = short leg
+		}
+
+		private static readonly Dictionary&lt;string, TrackedLegState&gt; _trackedLegs =
+			new Dictionary&lt;string, TrackedLegState&gt;(StringComparer.OrdinalIgnoreCase);
+
+		public override void Initialize(BarHistory bars)
+		{
+			EnsureSharedStateInitialized();
+
+			StartIndex = 0;
+
+			LoadSpyHistoryWithDiagnostics(bars);
+
+			WriteToDebugLog(
+				$"INIT | sym={bars.Symbol} | bars={bars.Count} | syncNull={_spyBarsSync == null} | rawNull={_spyBarsRaw == null}"
+			);
+		}
+
+		private void EnsureSharedStateInitialized()
+		{
+			lock (_stateLock)
+			{
+				if (!_sharedStateInitialized)
+				{
+					_nextPairTag = 1;
+					_trackedLegs.Clear();
+					_sharedStateInitialized = true;
+				}
+			}
+		}
+
+		private void LoadSpyHistoryWithDiagnostics(BarHistory bars)
+		{
+			_spyBarsSync = null;
+			_spyBarsRaw = null;
+
+			WriteToDebugLog($"SPY_LOAD | requesting dataset='{SpyUnderlyingDataSet}' | symbol='SPY' | scale={bars.Scale}");
+
+			try
+			{
+				_spyBarsSync = GetHistory(bars, "SPY", SpyUnderlyingDataSet);
+				WriteToDebugLog("SPY_LOAD | GetHistory completed");
+			}
+			catch (Exception ex)
+			{
+				WriteToDebugLog($"SPY_LOAD_FAIL | GetHistory | {ex.GetType().Name} | {ex.Message}");
+			}
+
+			try
+			{
+				_spyBarsRaw = GetHistoryUnsynched("SPY", bars.Scale, SpyUnderlyingDataSet);
+				WriteToDebugLog("SPY_LOAD | GetHistoryUnsynched completed");
+			}
+			catch (Exception ex)
+			{
+				WriteToDebugLog($"SPY_LOAD_FAIL | GetHistoryUnsynched | {ex.GetType().Name} | {ex.Message}");
+			}
+
+			if (_spyBarsSync != null &amp;&amp; _spyBarsSync.Count &gt; 0)
+			{
+				WriteToDebugLog(
+					$"SPY_SYNC_RANGE | first={_spyBarsSync.DateTimes[0]:yyyy-MM-dd HH:mm} | last={_spyBarsSync.DateTimes[_spyBarsSync.Count - 1]:yyyy-MM-dd HH:mm} | count={_spyBarsSync.Count}"
+				);
+			}
+			else
+			{
+				WriteToDebugLog("SPY_SYNC_RANGE | no bars");
+			}
+
+			if (_spyBarsRaw != null &amp;&amp; _spyBarsRaw.Count &gt; 0)
+			{
+				WriteToDebugLog(
+					$"SPY_RAW_RANGE | first={_spyBarsRaw.DateTimes[0]:yyyy-MM-dd HH:mm} | last={_spyBarsRaw.DateTimes[_spyBarsRaw.Count - 1]:yyyy-MM-dd HH:mm} | count={_spyBarsRaw.Count}"
+				);
+			}
+			else
+			{
+				WriteToDebugLog("SPY_RAW_RANGE | no bars");
+			}
+		}
+
+		public override void Execute(BarHistory bars, int idx)
+		{
+			if (!bars.Scale.IsIntraday)
+				return;
+
+			if (idx &lt; 0 || idx &gt;= bars.Count)
+				return;
+
+			DateTime dt = bars.DateTimes[idx];
+			int hhmm = dt.GetTime();
+
+			// First manage exits/pending fills for tracked symbols.
+			if (TryManageTrackedSymbolExit(bars, dt, hhmm))
+				return;
+
+			// Only audit entry decisions at the signal bar.
+			if (hhmm != 1500)
+				return;
+
+			// Preserve original rule: Monday-Thursday only.
+			if (dt.DayOfWeek != DayOfWeek.Monday &amp;&amp;
+				dt.DayOfWeek != DayOfWeek.Tuesday &amp;&amp;
+				dt.DayOfWeek != DayOfWeek.Wednesday &amp;&amp;
+				dt.DayOfWeek != DayOfWeek.Thursday)
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_DAY_OF_WEEK", $"day={dt.DayOfWeek}");
+				return;
+			}
+
+			if (!TryParseOptionSymbol(bars.Symbol, out string root, out DateTime expiry, out char cp, out double strike))
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_PARSE", null);
+				return;
+			}
+
+			string baseCtx = BuildBaseContext(
+				root,
+				expiry,
+				cp,
+				strike,
+				double.NaN,
+				double.NaN,
+				double.NaN,
+				double.NaN,
+				double.NaN,
+				double.NaN
+			);
+
+			if (!string.Equals(root, "SPY", StringComparison.OrdinalIgnoreCase))
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_ROOT", baseCtx);
+				return;
+			}
+
+			if (cp != 'C')
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_NOT_CALL", baseCtx);
+				return;
+			}
+
+			int dte = (expiry.Date - dt.Date).Days;
+
+			baseCtx = BuildBaseContext(
+				root,
+				expiry,
+				cp,
+				strike,
+				dte,
+				double.NaN,
+				double.NaN,
+				double.NaN,
+				double.NaN,
+				double.NaN
+			);
+
+			if (dte != 1)
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_DTE_SHORT", baseCtx);
+				return;
+			}
+
+			if (!IsWholeDollarStrike(strike))
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_NONWHOLE_STRIKE", baseCtx);
+				return;
+			}
+
+			double spyPrice = GetSpyPrice(dt, idx);
+			if (double.IsNaN(spyPrice) || spyPrice &lt;= 0)
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_SPYPRICE", baseCtx);
+				return;
+			}
+
+			double targetStrike = GetTargetStrikeRoundHalfDown(spyPrice);
+
+			double optOpen = bars.Open[idx];
+			double optClose = bars.Close[idx];
+			double openClosePct = double.NaN;
+
+			if (!double.IsNaN(optOpen) &amp;&amp; optOpen &gt; 0 &amp;&amp; !double.IsNaN(optClose))
+				openClosePct = Math.Abs(optClose - optOpen) / optOpen;
+
+			baseCtx = BuildBaseContext(
+				root,
+				expiry,
+				cp,
+				strike,
+				dte,
+				spyPrice,
+				targetStrike,
+				optOpen,
+				optClose,
+				openClosePct
+			);
+
+			if (double.IsNaN(optOpen) || optOpen &lt;= 0)
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_SHORT_OPEN", baseCtx);
+				return;
+			}
+
+			if (Math.Abs(strike - targetStrike) &gt; StrikeTolerance)
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_NOT_ATM", baseCtx);
+				return;
+			}
+
+			if (double.IsNaN(optClose) || optClose &lt;= 0)
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_SHORT_CLOSE", baseCtx);
+				return;
+			}
+
+			if (double.IsNaN(openClosePct) || openClosePct &gt;= MaxEntryBarOpenClosePct)
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_OC_PCT", baseCtx);
+				return;
+			}
+
+			if (!TryLoadLongLegHistory(
+				bars,
+				idx,
+				dt,
+				root,
+				cp,
+				targetStrike,
+				out BarHistory longLegBars,
+				out string longLegSymbol,
+				out string longLoadAudit))
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_LONG_LEG_LOAD", JoinContext(baseCtx, longLoadAudit));
+				return;
+			}
+
+			int fillIdx = idx + 1;
+
+			if (fillIdx &gt;= bars.Count)
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_SHORT_FILLIDX", JoinContext(baseCtx, $"fillIdx={fillIdx} | shortCount={bars.Count}"));
+				return;
+			}
+
+			if (fillIdx &gt;= longLegBars.Count)
+			{
+				WriteAudit(
+					dt,
+					bars.Symbol,
+					"REJECT_LONG_FILLIDX",
+					JoinContext(baseCtx, $"fillIdx={fillIdx} | longSym={longLegSymbol} | longCount={longLegBars.Count}")
+				);
+				return;
+			}
+
+			double shortNextOpen = bars.Open[fillIdx];
+			double longNextClose = longLegBars.Close[fillIdx];
+
+			if (double.IsNaN(shortNextOpen) || shortNextOpen &lt;= 0)
+			{
+				WriteAudit(
+					dt,
+					bars.Symbol,
+					"REJECT_SHORT_NEXT_OPEN",
+					JoinContext(baseCtx, $"fillIdx={fillIdx} | shortNextOpen={Fmt(shortNextOpen)}")
+				);
+				return;
+			}
+
+			if (double.IsNaN(longNextClose) || longNextClose &lt;= 0)
+			{
+				WriteAudit(
+					dt,
+					bars.Symbol,
+					"REJECT_LONG_NEXT_CLOSE",
+					JoinContext(baseCtx, $"fillIdx={fillIdx} | longSym={longLegSymbol} | longNextClose={Fmt(longNextClose)}")
+				);
+				return;
+			}
+
+			if (!HasFutureExitBarAtOrAfter(bars, idx, dt, 1100))
+			{
+				WriteAudit(dt, bars.Symbol, "REJECT_SHORT_NO_1100_EXIT_BAR", baseCtx);
+				return;
+			}
+
+			if (!HasFutureExitBarAtOrAfter(longLegBars, idx, dt, 1100))
+			{
+				WriteAudit(
+					dt,
+					bars.Symbol,
+					"REJECT_LONG_NO_1100_EXIT_BAR",
+					JoinContext(baseCtx, $"longSym={longLegSymbol}")
+				);
+				return;
+			}
+
+			int pairTag = GetNextPairTag();
+			string optionName = $"Option {pairTag}";
+
+			// short leg tracked as IsLongLeg = false
+			TrackSymbol(bars.Symbol, pairTag, dt, false);
+
+			// long leg tracked as IsLongLeg = true
+			TrackSymbol(longLegSymbol, pairTag, dt, true);
+
+			PlaceTrade(bars, TransactionType.Short, OrderType.Market, 0, pairTag, $"{optionName} ShortATM1DTE300PM");
+			PlaceTrade(longLegBars, TransactionType.Buy, OrderType.MarketClose, 0, pairTag, $"{optionName} LongATM7DTE300PM");
+
+			WriteAudit(
+				dt,
+				bars.Symbol,
+				"ENTRY",
+				JoinContext(baseCtx, $"option={optionName} | longSym={longLegSymbol} | shortNextOpen={Fmt(shortNextOpen)} | longNextClose={Fmt(longNextClose)}")
+			);
+
+			WriteToDebugLog(
+				$"ENTRY_DIAGONAL | {dt:yyyy-MM-dd HH:mm} | option={optionName} | shortSym={bars.Symbol} | longSym={longLegSymbol} | strike={targetStrike:F2} | shortFill=nextOpen | longFill=nextClose"
+			);
+		}
+
+		private bool TryManageTrackedSymbolExit(BarHistory bars, DateTime dt, int hhmm)
+		{
+			if (!TryGetTrackedLeg(bars.Symbol, out TrackedLegState leg))
+				return false;
+
+			Position openHere = FindOpenPosition(leg.PairTag);
+
+			if (openHere == null)
+			{
+				// Allow the entire signal day to pass before deciding a leg never filled.
+				// This is important because the long leg fills with MarketClose.
+				if (dt.Date == leg.SignalDateTime.Date)
+					return true;
+
+				if (leg.ExitOrderPlaced)
+				{
+					UntrackSymbol(bars.Symbol);
+					WriteToDebugLog($"LEG_COMPLETE | {dt:yyyy-MM-dd HH:mm} | sym={bars.Symbol} | option=Option {leg.PairTag}");
+					return true;
+				}
+
+				UntrackSymbol(bars.Symbol);
+				WriteToDebugLog($"LEG_NEVER_FILLED | {dt:yyyy-MM-dd HH:mm} | sym={bars.Symbol} | option=Option {leg.PairTag}");
+				return true;
+			}
+
+			bool nextDay = dt.Date &gt; openHere.EntryDate.Date;
+
+			if (!leg.ExitOrderPlaced &amp;&amp; nextDay &amp;&amp; hhmm &gt;= 1100)
+			{
+				if (leg.IsLongLeg)
+				{
+					// LONG EXITS AT OPEN
+					ClosePosition(openHere, OrderType.Market, 0, $"Option {leg.PairTag} LongNextDayOpenExit");
+
+					WriteToDebugLog(
+						$"EXIT_LONG_OPEN | {dt:yyyy-MM-dd HH:mm} | sym={bars.Symbol} | option=Option {leg.PairTag}"
+					);
+				}
+				else
+				{
+					// SHORT EXITS AT CLOSE
+					ClosePosition(openHere, OrderType.MarketClose, 0, $"Option {leg.PairTag} ShortNextDayCloseExit");
+
+					WriteToDebugLog(
+						$"EXIT_SHORT_CLOSE | {dt:yyyy-MM-dd HH:mm} | sym={bars.Symbol} | option=Option {leg.PairTag}"
+					);
+				}
+
+				lock (_stateLock)
+				{
+					if (_trackedLegs.TryGetValue(bars.Symbol, out TrackedLegState live))
+						live.ExitOrderPlaced = true;
+				}
+			}
+
+			return true;
+		}
+
+		private static int GetNextPairTag()
+		{
+			lock (_stateLock)
+			{
+				return _nextPairTag++;
+			}
+		}
+
+		private static void TrackSymbol(string symbol, int pairTag, DateTime signalDateTime, bool isLongLeg)
+		{
+			lock (_stateLock)
+			{
+				_trackedLegs[symbol] = new TrackedLegState
+				{
+					PairTag = pairTag,
+					SignalDateTime = signalDateTime,
+					ExitOrderPlaced = false,
+					IsLongLeg = isLongLeg
+				};
+			}
+		}
+
+		private static void UntrackSymbol(string symbol)
+		{
+			lock (_stateLock)
+			{
+				_trackedLegs.Remove(symbol);
+			}
+		}
+
+		private static bool TryGetTrackedLeg(string symbol, out TrackedLegState leg)
+		{
+			lock (_stateLock)
+			{
+				return _trackedLegs.TryGetValue(symbol, out leg);
+			}
+		}
+
+		private static bool HasFutureExitBarAtOrAfter(BarHistory bh, int idx, DateTime entrySignalDt, int targetHhmm)
+		{
+			if (bh == null || bh.Count == 0)
+				return false;
+
+			for (int i = Math.Max(0, idx + 1); i &lt; bh.Count; i++)
+			{
+				DateTime futureDt = bh.DateTimes[i];
+				if (futureDt.Date &gt; entrySignalDt.Date &amp;&amp; futureDt.GetTime() &gt;= targetHhmm)
+					return true;
+			}
+
+			return false;
+		}
+
+		private bool TryLoadLongLegHistory(
+			BarHistory anchorBars,
+			int idx,
+			DateTime entryDt,
+			string root,
+			char cp,
+			double strike,
+			out BarHistory longLegBars,
+			out string longLegSymbol,
+			out string longLoadAudit)
+		{
+			longLegBars = null;
+			longLegSymbol = string.Empty;
+			longLoadAudit = string.Empty;
+
+			DateTime longExpiry = entryDt.Date.AddDays(7);
+
+			string simpleSym = BuildSimpleOptionSymbol(root, longExpiry, cp, strike);
+			string occSym = BuildOccOptionSymbol(root, longExpiry, cp, strike);
+
+			string simpleStatus;
+			if (TryLoadCandidateHistory(anchorBars, simpleSym, idx, out BarHistory simpleBars, out simpleStatus))
+			{
+				longLegBars = simpleBars;
+				longLegSymbol = simpleSym;
+				longLoadAudit =
+					$"longExpiry={longExpiry:yyyy-MM-dd} | simpleSym={simpleSym} | simpleStatus={simpleStatus}";
+				return true;
+			}
+
+			string occStatus = "skipped_same_symbol";
+			if (!string.Equals(occSym, simpleSym, StringComparison.OrdinalIgnoreCase))
+			{
+				if (TryLoadCandidateHistory(anchorBars, occSym, idx, out BarHistory occBars, out occStatus))
+				{
+					longLegBars = occBars;
+					longLegSymbol = occSym;
+					longLoadAudit =
+						$"longExpiry={longExpiry:yyyy-MM-dd} | simpleSym={simpleSym} | simpleStatus={simpleStatus} | occSym={occSym} | occStatus={occStatus}";
+					return true;
+				}
+			}
+
+			longLoadAudit =
+				$"longExpiry={longExpiry:yyyy-MM-dd} | simpleSym={simpleSym} | simpleStatus={simpleStatus} | occSym={occSym} | occStatus={occStatus}";
+
+			return false;
+		}
+
+		private bool TryLoadCandidateHistory(
+			BarHistory anchorBars,
+			string symbol,
+			int idx,
+			out BarHistory candidateBars,
+			out string status)
+		{
+			candidateBars = null;
+			status = string.Empty;
+
+			try
+			{
+				candidateBars = GetHistory(anchorBars, symbol, null);
+			}
+			catch (Exception ex)
+			{
+				status = $"loadException={ex.GetType().Name}:{SanitizeForLog(ex.Message)}";
+				return false;
+			}
+
+			if (candidateBars == null)
+			{
+				status = "nullHistory";
+				return false;
+			}
+
+			if (idx &gt;= candidateBars.Count)
+			{
+				status = $"idxOutOfRange | idx={idx} | count={candidateBars.Count}";
+				return false;
+			}
+
+			int fillIdx = idx + 1;
+			if (fillIdx &gt;= candidateBars.Count)
+			{
+				status = $"noFillBar | fillIdx={fillIdx} | count={candidateBars.Count}";
+				return false;
+			}
+
+			double nextClose = candidateBars.Close[fillIdx];
+			if (double.IsNaN(nextClose) || nextClose &lt;= 0)
+			{
+				status = $"badNextClose | fillIdx={fillIdx} | nextClose={Fmt(nextClose)} | count={candidateBars.Count}";
+				return false;
+			}
+
+			status = $"ok | count={candidateBars.Count} | nextClose={Fmt(nextClose)}";
+			return true;
+		}
+
+		private static string BuildSimpleOptionSymbol(string root, DateTime expiry, char cp, double strike)
+		{
+			string strikeText;
+
+			if (IsWholeDollarStrike(strike))
+				strikeText = Math.Round(strike, 0).ToString("0", CultureInfo.InvariantCulture);
+			else
+				strikeText = strike.ToString("0.###", CultureInfo.InvariantCulture);
+
+			return $"{root}{expiry:yyMMdd}{cp}{strikeText}";
+		}
+
+		private static string BuildOccOptionSymbol(string root, DateTime expiry, char cp, double strike)
+		{
+			long occStrike = (long)Math.Round(strike * 1000.0, 0, MidpointRounding.AwayFromZero);
+			return $"{root}{expiry:yyMMdd}{cp}{occStrike:00000000}";
+		}
+
+		private double GetSpyPrice(DateTime optionDt, int syncIdx)
+		{
+			if (_spyBarsSync != null &amp;&amp; syncIdx &gt;= 0 &amp;&amp; syncIdx &lt; _spyBarsSync.Count)
+			{
+				double v = GetLastValidClose(_spyBarsSync, syncIdx);
+				if (!double.IsNaN(v) &amp;&amp; v &gt; 0)
+					return v;
+			}
+
+			if (_spyBarsRaw != null &amp;&amp; _spyBarsRaw.Count &gt; 0)
+			{
+				DateTime first = _spyBarsRaw.DateTimes[0];
+				DateTime last = _spyBarsRaw.DateTimes[_spyBarsRaw.Count - 1];
+
+				if (optionDt &gt;= first &amp;&amp; optionDt &lt;= last)
+				{
+					for (int i = _spyBarsRaw.Count - 1; i &gt;= 0; i--)
+					{
+						if (_spyBarsRaw.DateTimes[i] &lt;= optionDt)
+						{
+							double v = GetLastValidClose(_spyBarsRaw, i);
+							if (!double.IsNaN(v) &amp;&amp; v &gt; 0)
+								return v;
+							break;
+						}
+					}
+				}
+			}
+
+			return double.NaN;
+		}
+
+		private static double GetTargetStrikeRoundHalfDown(double underlyingPrice)
+		{
+			if (double.IsNaN(underlyingPrice) || double.IsInfinity(underlyingPrice))
+				return double.NaN;
+
+			double floored = Math.Floor(underlyingPrice);
+			double frac = underlyingPrice - floored;
+
+			if (Math.Abs(frac - 0.5) &lt;= StrikeTolerance)
+				return floored;
+
+			return Math.Round(underlyingPrice, 0, MidpointRounding.AwayFromZero);
+		}
+
+		private static double GetLastValidClose(BarHistory bh, int idx)
+		{
+			if (bh == null || bh.Count == 0)
+				return double.NaN;
+
+			for (int i = Math.Min(idx, bh.Count - 1); i &gt;= 0; i--)
+			{
+				double v = bh.Close[i];
+				if (!double.IsNaN(v) &amp;&amp; v &gt; 0)
+					return v;
+			}
+
+			return double.NaN;
+		}
+
+		private static bool IsWholeDollarStrike(double strike)
+		{
+			return Math.Abs(strike - Math.Round(strike, 0)) &lt; StrikeTolerance;
+		}
+
+		private static bool TryParseOptionSymbol(string sym, out string root, out DateTime expiry, out char cp, out double strike)
+		{
+			root = string.Empty;
+			expiry = DateTime.MinValue;
+			cp = '\0';
+			strike = double.NaN;
+
+			if (string.IsNullOrWhiteSpace(sym))
+				return false;
+
+			int cIdx = sym.LastIndexOf('C');
+			int pIdx = sym.LastIndexOf('P');
+			int typeIdx = Math.Max(cIdx, pIdx);
+
+			if (typeIdx &lt; 7)
+				return false;
+
+			cp = sym[typeIdx];
+
+			int dateStart = typeIdx - 6;
+			root = sym.Substring(0, dateStart);
+
+			string datePart = sym.Substring(dateStart, 6);
+			if (!DateTime.TryParseExact(datePart, "yyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out expiry))
+				return false;
+
+			string strikePart = sym.Substring(typeIdx + 1);
+
+			if (strikePart.Length &gt;= 8 &amp;&amp; long.TryParse(strikePart, out long occStrike))
+			{
+				strike = occStrike / 1000.0;
+				return true;
+			}
+
+			if (double.TryParse(strikePart, NumberStyles.Any, CultureInfo.InvariantCulture, out double simpleStrike))
+			{
+				strike = simpleStrike;
+				return true;
+			}
+
+			return false;
+		}
+
+		private void WriteAudit(DateTime dt, string symbol, string result, string details)
+		{
+			if (string.IsNullOrWhiteSpace(details))
+				WriteToDebugLog($"AUDIT | {dt:yyyy-MM-dd HH:mm} | sym={symbol} | result={result}");
+			else
+				WriteToDebugLog($"AUDIT | {dt:yyyy-MM-dd HH:mm} | sym={symbol} | result={result} | {details}");
+		}
+
+		private static string BuildBaseContext(
+			string root,
+			DateTime expiry,
+			char cp,
+			double strike,
+			double dte,
+			double spy,
+			double targetStrike,
+			double optOpen,
+			double optClose,
+			double ocPct)
+		{
+			return
+				$"root={root}" +
+				$" | cp={cp}" +
+				$" | expiry={(expiry == DateTime.MinValue ? "n/a" : expiry.ToString("yyyy-MM-dd"))}" +
+				$" | dte={Fmt(dte, "0")}" +
+				$" | strike={Fmt(strike)}" +
+				$" | spy={Fmt(spy)}" +
+				$" | targetStrike={Fmt(targetStrike)}" +
+				$" | optOpen={Fmt(optOpen)}" +
+				$" | optClose={Fmt(optClose)}" +
+				$" | ocPct={FmtPct(ocPct)}";
+		}
+
+		private static string JoinContext(string left, string right)
+		{
+			if (string.IsNullOrWhiteSpace(left))
+				return right ?? string.Empty;
+
+			if (string.IsNullOrWhiteSpace(right))
+				return left;
+
+			return left + " | " + right;
+		}
+
+		private static string Fmt(double value, string format = "0.00")
+		{
+			if (double.IsNaN(value) || double.IsInfinity(value))
+				return "n/a";
+
+			return value.ToString(format, CultureInfo.InvariantCulture);
+		}
+
+		private static string FmtPct(double value)
+		{
+			if (double.IsNaN(value) || double.IsInfinity(value))
+				return "n/a";
+
+			return value.ToString("P2", CultureInfo.InvariantCulture);
+		}
+
+		private static string SanitizeForLog(string text)
+		{
+			if (string.IsNullOrEmpty(text))
+				return string.Empty;
+
+			return text.Replace("|", "/").Replace("\r", " ").Replace("\n", " ");
+		}
+	}
+}</StrategyData>
+  <LibraryName />
+  <FolderName>Used</FolderName>
+  <DataSetName>Morning Payout Test;ASCII</DataSetName>
+  <UseSelectedDataSetOnly>false</UseSelectedDataSetOnly>
+  <SingleSymbolMode>false</SingleSymbolMode>
+  <Scale>
+    <Frequency>Minute</Frequency>
+    <Interval>30</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </Scale>
+  <DataRange>
+    <DataRangeType>RecentYears</DataRangeType>
+    <RecentValue>5</RecentValue>
+    <StartDate>0001-01-01T00:00:00</StartDate>
+    <EndDate>0001-01-01T00:00:00</EndDate>
+  </DataRange>
+  <PositionSize>
+    <PositionSizeType>Quantity</PositionSizeType>
+    <Amount>100</Amount>
+    <PositionSizerName />
+    <PositionSizerParameters />
+    <StartingCapital>100000</StartingCapital>
+    <MarginFactor>1</MarginFactor>
+    <MaxOpenPositions>2</MaxOpenPositions>
+    <MaxOpenPositionsLong>0</MaxOpenPositionsLong>
+    <MaxOpenPositionsShort>0</MaxOpenPositionsShort>
+    <MaxOpenPositionsInSymbol>0</MaxOpenPositionsInSymbol>
+    <UseNextBarOpenAsBasisPrice>true</UseNextBarOpenAsBasisPrice>
+    <StartingCapOptValues>
+      <MinValue>50000</MinValue>
+      <MaxValue>200000</MaxValue>
+      <StepValue>10000</StepValue>
+    </StartingCapOptValues>
+    <FixedAmountOptValues>
+      <MinValue>1000</MinValue>
+      <MaxValue>10000</MaxValue>
+      <StepValue>1000</StepValue>
+    </FixedAmountOptValues>
+    <PctEquityOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>20</MaxValue>
+      <StepValue>1</StepValue>
+    </PctEquityOptValues>
+    <FixedQtyOptValues>
+      <MinValue>100</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>100</StepValue>
+    </FixedQtyOptValues>
+    <MarginOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>2</MaxValue>
+      <StepValue>0.1</StepValue>
+    </MarginOptValues>
+    <MaxRiskOptValues>
+      <MinValue>5</MinValue>
+      <MaxValue>50</MaxValue>
+      <StepValue>5</StepValue>
+    </MaxRiskOptValues>
+    <MaxOpenPosOptValues>
+      <MinValue>1</MinValue>
+      <MaxValue>1000</MaxValue>
+      <StepValue>1</StepValue>
+    </MaxOpenPosOptValues>
+    <MaxSignalsPerBar>0</MaxSignalsPerBar>
+    <StartingCapOpt>false</StartingCapOpt>
+    <AmountOpt>false</AmountOpt>
+    <MarginOpt>false</MarginOpt>
+    <MaxOpenPosOpt>false</MaxOpenPosOpt>
+  </PositionSize>
+  <Benchmark>SPY</Benchmark>
+  <SingleSymbol>SPY</SingleSymbol>
+  <RunWithWFOParameters>false</RunWithWFOParameters>
+  <RunWithPreferredValues>false</RunWithPreferredValues>
+  <RetainNSF>true</RetainNSF>
+  <GranularLimitStopScale>
+    <Frequency>Daily</Frequency>
+    <Interval>1</Interval>
+    <FilterPrePost>true</FilterPrePost>
+  </GranularLimitStopScale>
+  <UpdateGranularData>true</UpdateGranularData>
+  <IsWLComPublishedStrategy>false</IsWLComPublishedStrategy>
+  <IsWLComUserStrategy>false</IsWLComUserStrategy>
+  <MarkedReadOnly>false</MarkedReadOnly>
+  <IsRunningInEvolver>false</IsRunningInEvolver>
+  <CouldOptimize>false</CouldOptimize>
+  <ParametersEnabled />
+  <IsLinkedToExternalFile>false</IsLinkedToExternalFile>
+  <LinkedFileName />
+  <CompiledStrategyTypeName />
+</Strategy>
