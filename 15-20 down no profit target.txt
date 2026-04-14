@@ -1,0 +1,197 @@
+using System;
+using System.Collections.Generic;
+using WealthLab.Backtest;
+using WealthLab.Core;
+
+namespace WealthScript6 
+{
+	public class Long_5Min_3DayCapitulationGap_NoProfitTarget : UserStrategyBase
+	{
+		// ===== USER PREFERENCES / STANDARD LIQUIDITY FILTERS =====
+		private const double MinPrice = 5.0;
+		private const int DollarVolLookback = 20;
+		private const double MinAvgDollarVol = 500000.0;
+
+		// ===== SETUP =====
+		// Require 3 completed down days, then today's regular-session open
+		// must be down 15% to 20% versus the close from 4 trading sessions ago.
+		private const double MinDropPct = 15.0;
+		private const double MaxDropPct = 20.0;
+
+		// ===== EXITS =====
+		private const int MaxHoldTradingDays = 5;      // includes entry day
+
+		// ===== REGULAR SESSION WINDOW =====
+		// Assumes 5-minute bars are timestamped by BAR CLOSE.
+		// So 9:35 = first RTH bar, 16:00 = last RTH bar.
+		private static readonly TimeSpan EntryStartTime = new TimeSpan(9, 35, 0);
+		private static readonly TimeSpan EntryEndTime = new TimeSpan(16, 0, 0);
+
+		// ===== ALIGNED SERIES =====
+		private bool[] _isFirstRegularBar;
+		private bool[] _entrySignal;
+		private double[] _sessionOpen;
+		private double[] _dropPctFrom4DaysAgo;
+		private double[] _avgDollarVol20;
+
+		private sealed class SessionInfo
+		{
+			public DateTime Date;
+			public int FirstBar = -1;
+			public int LastBar = -1;
+			public double Open;
+			public double Close;
+			public double Volume;
+		}
+
+		public override void Initialize(BarHistory bars)
+		{
+			StartIndex = 1;
+			BuildRegularSessionData(bars);
+		}
+
+		public override void Execute(BarHistory bars, int idx)
+		{
+			TimeSpan t = bars.DateTimes[idx].TimeOfDay;
+
+			// ===== EXIT LOGIC =====
+			if (HasOpenPosition(bars, PositionType.Long))
+			{
+				Position p = LastOpenPosition;
+				if (p != null)
+				{
+					// Exit on first regular bar of the 5th trading day including entry day
+					if (_isFirstRegularBar[idx] && p.DaysInPosition(idx, false) >= MaxHoldTradingDays - 1)
+						ClosePosition(p, OrderType.Market);
+				}
+				return;
+			}
+
+			// ===== ENTRY LOGIC =====
+			// Only allow long entries during regular-session bars: 9:35 through 16:00.
+			if (!IsAllowedLongEntryBar(t))
+				return;
+
+			// This strategy is open-based, so the signal is only placed on the first regular bar.
+			if (_entrySignal[idx])
+				PlaceTrade(bars, TransactionType.Buy, OrderType.Market);
+		}
+
+		private void BuildRegularSessionData(BarHistory bars)
+		{
+			int count = bars.Count;
+
+			_isFirstRegularBar = new bool[count];
+			_entrySignal = new bool[count];
+			_sessionOpen = new double[count];
+			_dropPctFrom4DaysAgo = new double[count];
+			_avgDollarVol20 = new double[count];
+
+			if (count == 0)
+				return;
+
+			List<SessionInfo> sessions = new List<SessionInfo>();
+
+			DateTime currentDate = bars.DateTimes[0].Date;
+			SessionInfo currentSession = new SessionInfo { Date = currentDate };
+
+			for (int i = 0; i < count; i++)
+			{
+				DateTime dt = bars.DateTimes[i];
+				DateTime barDate = dt.Date;
+				TimeSpan barTime = dt.TimeOfDay;
+
+				// New calendar day -> finalize previous session if it had any RTH bars
+				if (barDate != currentDate)
+				{
+					if (currentSession.FirstBar >= 0)
+						sessions.Add(currentSession);
+
+					currentDate = barDate;
+					currentSession = new SessionInfo { Date = currentDate };
+				}
+
+				// Only build session stats from allowed regular-session bars
+				if (!IsAllowedLongEntryBar(barTime))
+					continue;
+
+				if (currentSession.FirstBar < 0)
+				{
+					currentSession.FirstBar = i;
+					currentSession.Open = bars.Open[i];
+				}
+
+				currentSession.LastBar = i;
+				currentSession.Close = bars.Close[i];
+				currentSession.Volume += bars.Volume[i];
+			}
+
+			// Finalize last session if valid
+			if (currentSession.FirstBar >= 0)
+				sessions.Add(currentSession);
+
+			// Align regular-session logic back to the intraday bars
+			for (int s = 0; s < sessions.Count; s++)
+			{
+				SessionInfo cur = sessions[s];
+				_isFirstRegularBar[cur.FirstBar] = true;
+
+				double avgDollarVol20 = double.NaN;
+				if (s >= DollarVolLookback)
+				{
+					double sumDollarVol = 0.0;
+					for (int k = s - DollarVolLookback; k < s; k++)
+						sumDollarVol += sessions[k].Close * sessions[k].Volume;
+
+					avgDollarVol20 = sumDollarVol / DollarVolLookback;
+				}
+
+				bool threeDown = false;
+				double dropPct = double.NaN;
+
+				if (s >= 4)
+				{
+					double close4Ago = sessions[s - 4].Close;
+					double close3Ago = sessions[s - 3].Close;
+					double close2Ago = sessions[s - 2].Close;
+					double close1Ago = sessions[s - 1].Close;
+
+					threeDown =
+						close3Ago < close4Ago &&
+						close2Ago < close3Ago &&
+						close1Ago < close2Ago;
+
+					if (close4Ago > 0.0)
+						dropPct = 100.0 * (cur.Open / close4Ago - 1.0);
+				}
+
+				bool passesLiquidity =
+					s >= DollarVolLookback &&
+					sessions[s - 1].Close >= MinPrice &&
+					avgDollarVol20 >= MinAvgDollarVol;
+
+				bool passesCapitulationDrop =
+					!double.IsNaN(dropPct) &&
+					dropPct <= -MinDropPct &&
+					dropPct >= -MaxDropPct;
+
+				bool signal = threeDown && passesLiquidity && passesCapitulationDrop;
+
+				for (int i = cur.FirstBar; i <= cur.LastBar; i++)
+				{
+					_sessionOpen[i] = cur.Open;
+					_dropPctFrom4DaysAgo[i] = dropPct;
+					_avgDollarVol20[i] = avgDollarVol20;
+				}
+
+				// Only signal on the first regular bar of the day (9:35 bar)
+				_entrySignal[cur.FirstBar] = signal;
+			}
+		}
+
+		private bool IsAllowedLongEntryBar(TimeSpan t)
+		{
+			return t >= EntryStartTime && t <= EntryEndTime;
+		}
+	}
+}
