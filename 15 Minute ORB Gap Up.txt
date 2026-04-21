@@ -1,0 +1,408 @@
+using System;
+using System.Collections.Generic;
+using WealthLab.Backtest;
+using WealthLab.Core;
+using WealthLab.Indicators;
+
+namespace WealthScript2 
+{
+	public class MabeKit_OR15_Long : UserStrategyBase
+	{
+		// ----- Parameters / settings -----
+		private const int DailyVolumeLookback = 20;
+		private const double MinAverageDailyVolume = 500000;
+		private const double MinGapUpPct = 3.0;
+		private const double MinPrice = 5.0;
+		private const double MaxPrice = 50.0;
+
+		// 15-minute version:
+		// first regular bar closes at 9:45, so earliest practical signal starts after that
+		private const int FirstTradeTimeMinutesFromOpen = 15;   // 9:45 bar is the OR bar
+		private const int LatestTradeTimeMinutesFromOpen = 90;  // < 11:00
+		private const int MaxTradesPerDay = 1;
+
+		private const double EntryOffset = 0.01;
+		private const double StopOffset = 0.01;
+		private const double TargetR = 1.75;
+
+		// Scorecard filter thresholds
+		private const double MkBollMin = 90.5253;
+		private const double MkDrsiMax = 59.25;
+		private const double MkMa50RMin = 13.08;
+
+		// 15:50 from the AFL does not align cleanly to 15-minute bars,
+		// so for the 15-minute WL version I exit at the 15:45 bar close.
+		private static readonly TimeSpan TimedExitBarClose = new TimeSpan(15, 45, 0);
+
+		// ----- Per-session state -----
+		private readonly Queue<double> _recentDailyVolumes = new Queue<double>();
+
+		private DateTime _currentSessionDate = DateTime.MinValue;
+		private double _currentDayVolume = 0.0;
+		private double _lastRegularSessionClose = double.NaN;
+		private double _previousRegularSessionClose = double.NaN;
+		private double _currentGapUpPct = double.NaN;
+		private double _openingRange15High = double.NaN;
+		private double _lowOfDaySoFar = double.NaN;
+		private bool _onTodaysWatchlist = false;
+		private int _tradesToday = 0;
+
+		// Pending trade state (signal bar values, activated after next-bar entry fills)
+		private bool _hasPendingTrade = false;
+		private double _pendingStopPrice = double.NaN;
+		private double _pendingTargetPrice = double.NaN;
+
+		// Active position management
+		private double _activeStopPrice = double.NaN;
+		private double _activeTargetPrice = double.NaN;
+
+		// ----- Daily cache for MK_Boll + MK_DRSI + MK_MA50R -----
+		private BarHistory _dailyBars;
+		private TimeSeries _dailyBollMid;
+		private TimeSeries _dailyBollSd;
+		private TimeSeries _dailyRsi14;
+		private TimeSeries _dailySma50;
+		private double[] _dailyVwv;
+
+		public override void Initialize(BarHistory bars)
+		{
+			StartIndex = 1;
+			PlotStopsAndLimits(4);
+
+			// Build daily references used by the scorecards:
+			// dailyRefBar = last completed daily bar strictly before signalDate
+			_dailyBars = BarHistoryCompressor.ToDaily(bars);
+
+			if (_dailyBars != null && _dailyBars.Count > 0)
+			{
+				_dailyBollMid = SMA.Series(_dailyBars.Close, 20);
+				_dailyBollSd = StdDev.Series(_dailyBars.Close, 20);
+				_dailyRsi14 = RSI.Series(_dailyBars.Close, 14);
+				_dailySma50 = SMA.Series(_dailyBars.Close, 50);
+				_dailyVwv = ComputeVwvSeries(bars, _dailyBars);
+			}
+		}
+
+		public override void Execute(BarHistory bars, int idx)
+		{
+			Position p = LastOpenPosition;
+
+			// If a pending market order filled on this bar's open, promote pending levels to active.
+			if (p != null && p.IsOpen && _hasPendingTrade)
+			{
+				_activeStopPrice = _pendingStopPrice;
+				_activeTargetPrice = _pendingTargetPrice;
+
+				_hasPendingTrade = false;
+				_pendingStopPrice = double.NaN;
+				_pendingTargetPrice = double.NaN;
+			}
+
+			TimeSpan t = bars.DateTimes[idx].TimeOfDay;
+
+			// Ignore non-regular bars. This code is written for a 15-minute RTH chart.
+			if (!IsRegularSessionBar(t))
+				return;
+
+			// Start of a new regular session = 9:45 bar on WL 15-minute charts
+			if (IsFirstRegularBar(t))
+			{
+				StartNewRegularSession(bars, idx);
+			}
+
+			// Update current session stats
+			_currentDayVolume += bars.Volume[idx];
+			_lowOfDaySoFar = double.IsNaN(_lowOfDaySoFar) ? bars.Low[idx] : Math.Min(_lowOfDaySoFar, bars.Low[idx]);
+			_lastRegularSessionClose = bars.Close[idx];
+
+			// First 15-minute bar defines the opening range high, but we do not signal on that same bar
+			if (IsFirstRegularBar(t))
+			{
+				_openingRange15High = bars.High[idx];
+				return;
+			}
+
+			// ----- Exit logic -----
+			if (p != null && p.IsOpen)
+			{
+				if (!double.IsNaN(_activeStopPrice))
+					PlaceTrade(bars, TransactionType.Sell, OrderType.Stop, _activeStopPrice, "InitialStop");
+
+				if (!double.IsNaN(_activeTargetPrice))
+					PlaceTrade(bars, TransactionType.Sell, OrderType.Limit, _activeTargetPrice, "Target");
+
+				// Timed exit for 15-minute adaptation: 15:45 bar close
+				if (t >= TimedExitBarClose)
+					PlaceTrade(bars, TransactionType.Sell, OrderType.MarketClose, 0, "TimedExit");
+
+				return;
+			}
+
+			// ----- No new entries if daily limit already used -----
+			if (_tradesToday >= MaxTradesPerDay)
+				return;
+
+			// ----- Watchlist condition (persist once true for the day) -----
+			if (!_onTodaysWatchlist)
+			{
+				double avgDailyVol = AverageQueue(_recentDailyVolumes);
+
+				bool basicRequirements =
+					_recentDailyVolumes.Count >= DailyVolumeLookback &&
+					!double.IsNaN(avgDailyVol) &&
+					avgDailyVol >= MinAverageDailyVolume &&
+					!double.IsNaN(_currentGapUpPct) &&
+					_currentGapUpPct >= MinGapUpPct &&
+					bars.Close[idx] >= MinPrice &&
+					bars.Close[idx] <= MaxPrice;
+
+				if (basicRequirements)
+					_onTodaysWatchlist = true;
+			}
+
+			if (!_onTodaysWatchlist || double.IsNaN(_openingRange15High))
+				return;
+
+			// ----- Boll + DRSI + MA50R filters -----
+			if (!PassesScorecardFilters(bars, idx))
+				return;
+
+			int minutesSinceOpen = MinutesSinceOpen(t);
+
+			bool inTradeWindow =
+				minutesSinceOpen >= FirstTradeTimeMinutesFromOpen &&
+				minutesSinceOpen < LatestTradeTimeMinutesFromOpen;
+
+			// Visible AFL logic: trigger if High breaks the OR high
+			bool trigger = inTradeWindow && bars.High[idx] > _openingRange15High;
+
+			if (!trigger)
+				return;
+
+			// Wealth-Lab style: idx is the signal bar, entry occurs next bar
+			double intendedEntryPrice = _openingRange15High + EntryOffset;
+			double stopPrice = _lowOfDaySoFar - StopOffset;
+			double initialStopDistance = intendedEntryPrice - stopPrice;
+
+			if (initialStopDistance <= 0)
+				return;
+
+			double targetPrice = intendedEntryPrice + initialStopDistance * TargetR;
+
+			_pendingStopPrice = stopPrice;
+			_pendingTargetPrice = targetPrice;
+			_hasPendingTrade = true;
+
+			PlaceTrade(bars, TransactionType.Buy, OrderType.Market, 0, "OR15Breakout");
+			_tradesToday++;
+		}
+
+		private bool PassesScorecardFilters(BarHistory bars, int idx)
+		{
+			if (_dailyBars == null || _dailyBars.Count == 0 ||
+				_dailyBollMid == null || _dailyBollSd == null || _dailyRsi14 == null ||
+				_dailySma50 == null || _dailyVwv == null)
+				return false;
+
+			DateTime signalDate = bars.DateTimes[idx].Date;
+			double signalClose = bars.Close[idx];
+
+			if (!IsValid(signalClose) || signalClose <= 0)
+				return false;
+
+			// Scorecard convention:
+			// dailyRefBar = last completed daily bar strictly before signalDate
+			int d = FindLastDailyIndexBefore(signalDate);
+			if (d < 0)
+				return false;
+
+			double mkBoll = GetMkBoll(d, signalClose);
+			if (!(IsValid(mkBoll) && mkBoll > MkBollMin))
+				return false;
+
+			double mkDrsi = GetMkDrsi(d);
+			if (!(IsValid(mkDrsi) && mkDrsi < MkDrsiMax))
+				return false;
+
+			double mkMa50R = GetMkMa50R(d, signalClose);
+			if (!(IsValid(mkMa50R) && mkMa50R > MkMa50RMin))
+				return false;
+
+			return true;
+		}
+
+		private double GetMkBoll(int d, double signalClose)
+		{
+			if (_dailyBollMid == null || _dailyBollSd == null || d < 19 || d >= _dailyBollMid.Count || d >= _dailyBollSd.Count)
+				return double.NaN;
+
+			double mid = _dailyBollMid[d];
+			double sd = _dailyBollSd[d];
+
+			if (!IsValid(mid) || !IsValid(sd))
+				return double.NaN;
+
+			double upper = mid + 2.0 * sd;
+			double lower = mid - 2.0 * sd;
+			double width = upper - lower;
+
+			if (width <= 0)
+				return double.NaN;
+
+			return 100.0 * (signalClose - lower) / width;
+		}
+
+		private double GetMkDrsi(int d)
+		{
+			if (_dailyRsi14 == null || d < 13 || d >= _dailyRsi14.Count)
+				return double.NaN;
+
+			return _dailyRsi14[d];
+		}
+
+		private double GetMkMa50R(int d, double signalClose)
+		{
+			if (_dailySma50 == null || _dailyVwv == null || d < 49 || d >= _dailySma50.Count || d >= _dailyVwv.Length)
+				return double.NaN;
+
+			double sma50 = _dailySma50[d];
+			double vwv = _dailyVwv[d];
+
+			if (!IsValid(sma50) || !IsValid(vwv) || vwv <= 0)
+				return double.NaN;
+
+			return (signalClose - sma50) / vwv;
+		}
+
+		private int FindLastDailyIndexBefore(DateTime signalDate)
+		{
+			if (_dailyBars == null || _dailyBars.Count == 0)
+				return -1;
+
+			for (int i = _dailyBars.Count - 1; i >= 0; i--)
+			{
+				if (_dailyBars.DateTimes[i].Date < signalDate)
+					return i;
+			}
+
+			return -1;
+		}
+
+		private static double[] ComputeVwvSeries(BarHistory bars, BarHistory dailyBars)
+		{
+			int nDaily = dailyBars.Count;
+			double[] result = new double[nDaily];
+
+			Dictionary<DateTime, (double SumRange, int Count)> intradayRangeByDate = new();
+
+			for (int i = 0; i < bars.Count; i++)
+			{
+				TimeSpan t = bars.DateTimes[i].TimeOfDay;
+
+				if (!IsRegularSessionBar(t))
+					continue;
+
+				DateTime d = bars.DateTimes[i].Date;
+				double r = bars.High[i] - bars.Low[i];
+
+				if (!intradayRangeByDate.TryGetValue(d, out var entry))
+					entry = (0.0, 0);
+
+				intradayRangeByDate[d] = (entry.SumRange + r, entry.Count + 1);
+			}
+
+			double[] avgRange = new double[nDaily];
+			for (int i = 0; i < nDaily; i++)
+			{
+				DateTime d = dailyBars.DateTimes[i].Date;
+
+				if (intradayRangeByDate.TryGetValue(d, out var entry) && entry.Count > 0)
+					avgRange[i] = entry.SumRange / entry.Count;
+				else
+					avgRange[i] = double.NaN;
+			}
+
+			// VWV = 10-day MA of the daily average 15-minute range
+			// Require at least 5 valid days
+			for (int i = 0; i < nDaily; i++)
+			{
+				double sum = 0.0;
+				int count = 0;
+
+				for (int k = i; k >= Math.Max(0, i - 9); k--)
+				{
+					if (IsValid(avgRange[k]))
+					{
+						sum += avgRange[k];
+						count++;
+					}
+				}
+
+				result[i] = count >= 5 ? sum / count : double.NaN;
+			}
+
+			return result;
+		}
+
+		private void StartNewRegularSession(BarHistory bars, int idx)
+		{
+			DateTime d = bars.DateTimes[idx].Date;
+
+			// Finalize prior completed session volume
+			if (_currentSessionDate != DateTime.MinValue && _currentDayVolume > 0)
+			{
+				_recentDailyVolumes.Enqueue(_currentDayVolume);
+				while (_recentDailyVolumes.Count > DailyVolumeLookback)
+					_recentDailyVolumes.Dequeue();
+
+				_previousRegularSessionClose = _lastRegularSessionClose;
+			}
+
+			_currentSessionDate = d;
+			_currentDayVolume = 0.0;
+			_openingRange15High = double.NaN;
+			_lowOfDaySoFar = double.NaN;
+			_onTodaysWatchlist = false;
+			_tradesToday = 0;
+
+			_currentGapUpPct = double.NaN;
+			if (!double.IsNaN(_previousRegularSessionClose) && _previousRegularSessionClose > 0)
+			{
+				double todayOpen = bars.Open[idx];
+				_currentGapUpPct = (todayOpen / _previousRegularSessionClose - 1.0) * 100.0;
+			}
+		}
+
+		private static bool IsRegularSessionBar(TimeSpan t)
+		{
+			return t >= new TimeSpan(9, 45, 0) && t <= new TimeSpan(16, 0, 0);
+		}
+
+		private static bool IsFirstRegularBar(TimeSpan t)
+		{
+			return t == new TimeSpan(9, 45, 0);
+		}
+
+		private static int MinutesSinceOpen(TimeSpan t)
+		{
+			return (int)Math.Round((t - new TimeSpan(9, 30, 0)).TotalMinutes);
+		}
+
+		private static double AverageQueue(Queue<double> q)
+		{
+			if (q.Count == 0)
+				return double.NaN;
+
+			double sum = 0.0;
+			foreach (double v in q)
+				sum += v;
+
+			return sum / q.Count;
+		}
+
+		private static bool IsValid(double value)
+		{
+			return !double.IsNaN(value) && !double.IsInfinity(value);
+		}
+	}
+}

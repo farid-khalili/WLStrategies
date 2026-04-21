@@ -3,20 +3,27 @@ using System.Collections.Generic;
 using WealthLab.Backtest;
 using WealthLab.Core;
 
-namespace WealthScript6 
+namespace WealthScript1 
 {
-	public class Long_5Min_3DayCapitulationGap_NoProfitTarget : UserStrategyBase
+	public class Long_5Min_3DayCapitulationGap_NoProfitTarget_MK_RPD_Filtered : UserStrategyBase
 	{
 		// ===== USER PREFERENCES / STANDARD LIQUIDITY FILTERS =====
 		private const double MinPrice = 5.0;
+		private const double MaxPrice = 2000.0;
+		private const double MinPrevDayVolume = 250000.0;
 		private const int DollarVolLookback = 20;
 		private const double MinAvgDollarVol = 500000.0;
 
 		// ===== SETUP =====
 		// Require 3 completed down days, then today's regular-session open
-		// must be down 15% to 20% versus the close from 4 trading sessions ago.
-		private const double MinDropPct = 15.0;
+		// must be down 8% to 20% versus the close from 4 trading sessions ago.
+		private const double MinDropPct = 8.0;
 		private const double MaxDropPct = 20.0;
+
+		// ===== SCORECARD FILTER =====
+		// MK_RPD = 100 * (signalClose - yesterdayLow) / (yesterdayHigh - yesterdayLow)
+		// Filter: MK_RPD > -5.61507
+		private const double MkRpdThreshold = -5.61507;
 
 		// ===== EXITS =====
 		private const int MaxHoldTradingDays = 5;      // includes entry day
@@ -33,6 +40,7 @@ namespace WealthScript6
 		private double[] _sessionOpen;
 		private double[] _dropPctFrom4DaysAgo;
 		private double[] _avgDollarVol20;
+		private double[] _mkRpd;
 
 		private sealed class SessionInfo
 		{
@@ -40,6 +48,8 @@ namespace WealthScript6
 			public int FirstBar = -1;
 			public int LastBar = -1;
 			public double Open;
+			public double High = double.NaN;
+			public double Low = double.NaN;
 			public double Close;
 			public double Volume;
 		}
@@ -72,7 +82,8 @@ namespace WealthScript6
 			if (!IsAllowedLongEntryBar(t))
 				return;
 
-			// This strategy is open-based, so the signal is only placed on the first regular bar.
+			// Signal is evaluated on the first regular bar close (9:35 bar),
+			// and the market order fills on the next bar open.
 			if (_entrySignal[idx])
 				PlaceTrade(bars, TransactionType.Buy, OrderType.Market);
 		}
@@ -86,6 +97,7 @@ namespace WealthScript6
 			_sessionOpen = new double[count];
 			_dropPctFrom4DaysAgo = new double[count];
 			_avgDollarVol20 = new double[count];
+			_mkRpd = new double[count];
 
 			if (count == 0)
 				return;
@@ -119,6 +131,16 @@ namespace WealthScript6
 				{
 					currentSession.FirstBar = i;
 					currentSession.Open = bars.Open[i];
+					currentSession.High = bars.High[i];
+					currentSession.Low = bars.Low[i];
+				}
+				else
+				{
+					if (bars.High[i] > currentSession.High)
+						currentSession.High = bars.High[i];
+
+					if (bars.Low[i] < currentSession.Low)
+						currentSession.Low = bars.Low[i];
 				}
 
 				currentSession.LastBar = i;
@@ -148,6 +170,7 @@ namespace WealthScript6
 
 				bool threeDown = false;
 				double dropPct = double.NaN;
+				double mkRpd = double.NaN;
 
 				if (s >= 4)
 				{
@@ -165,9 +188,22 @@ namespace WealthScript6
 						dropPct = 100.0 * (cur.Open / close4Ago - 1.0);
 				}
 
+				// MK_RPD uses the signal bar close versus yesterday's daily range.
+				// Since entry fills on the next bar, the signal bar here is today's first regular bar.
+				if (s >= 1)
+				{
+					double signalClose = bars.Close[cur.FirstBar];
+					double yesterdayLow = sessions[s - 1].Low;
+					double yesterdayHigh = sessions[s - 1].High;
+
+					mkRpd = RangePosition(signalClose, yesterdayLow, yesterdayHigh);
+				}
+
 				bool passesLiquidity =
 					s >= DollarVolLookback &&
 					sessions[s - 1].Close >= MinPrice &&
+					sessions[s - 1].Close <= MaxPrice &&
+					sessions[s - 1].Volume >= MinPrevDayVolume &&
 					avgDollarVol20 >= MinAvgDollarVol;
 
 				bool passesCapitulationDrop =
@@ -175,18 +211,41 @@ namespace WealthScript6
 					dropPct <= -MinDropPct &&
 					dropPct >= -MaxDropPct;
 
-				bool signal = threeDown && passesLiquidity && passesCapitulationDrop;
+				bool passesMkRpd =
+					!double.IsNaN(mkRpd) &&
+					mkRpd > MkRpdThreshold;
+
+				bool signal =
+					threeDown &&
+					passesLiquidity &&
+					passesCapitulationDrop &&
+					passesMkRpd;
 
 				for (int i = cur.FirstBar; i <= cur.LastBar; i++)
 				{
 					_sessionOpen[i] = cur.Open;
 					_dropPctFrom4DaysAgo[i] = dropPct;
 					_avgDollarVol20[i] = avgDollarVol20;
+					_mkRpd[i] = mkRpd;
 				}
 
 				// Only signal on the first regular bar of the day (9:35 bar)
 				_entrySignal[cur.FirstBar] = signal;
 			}
+		}
+
+		private static double RangePosition(double value, double low, double high)
+		{
+			if (double.IsNaN(value) || double.IsInfinity(value) ||
+				double.IsNaN(low) || double.IsInfinity(low) ||
+				double.IsNaN(high) || double.IsInfinity(high))
+				return double.NaN;
+
+			double width = high - low;
+			if (width <= 0.0)
+				return double.NaN;
+
+			return 100.0 * (value - low) / width;
 		}
 
 		private bool IsAllowedLongEntryBar(TimeSpan t)
